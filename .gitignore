@@ -1,0 +1,7 @@
+# Local OpenBao state / secrets — never commit
+file/
+*.hcl.local
+init.json
+unseal-keys*.txt
+root-token*.txt
+.env
