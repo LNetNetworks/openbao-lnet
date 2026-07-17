@@ -4,4 +4,5 @@ file/
 init.json
 unseal-keys*.txt
 root-token*.txt
+vault-init.txt
 .env
