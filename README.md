@@ -14,7 +14,7 @@ The signing engine is [`kaleido-io/vault-plugin-secrets-ethsign`](https://github
 | Path | Purpose |
 |------|---------|
 | `Dockerfile` | Multi-stage build: compiles the `ethsign` plugin, then bakes it into the official `openbao/openbao` image. |
-| `config/openbao.hcl` | OpenBao server config (TCP listener, file storage, `plugin_directory`). |
+| `config/openbao.hcl` | OpenBao server config (TCP listener, Raft integrated storage, `plugin_directory`). |
 | `docker-compose.yml` | Brings up the server with the plugin available. |
 | `scripts/register-plugin.sh` | Registers + enables the `ethsign` engine in a running, unsealed server. |
 | `scripts/demo-sign.sh` | End-to-end demo: create an account and sign a transaction. |
@@ -156,7 +156,11 @@ docker compose down -v     # stop and DELETE the data volume (keys are gone!)
   TLS on the listener for any real deployment.
 - **mlock:** `disable_mlock = true` is set for containers; the compose file also
   grants `IPC_LOCK`. Review per your threat model.
-- **Backups:** the file storage backend lives in the `openbao-data` volume —
-  back it up, and protect your unseal keys/root token.
+- **Storage:** this POC uses **Integrated Storage (Raft)** — OpenBao's
+  recommended production backend, with native HA and no external database. In
+  Kubernetes, run a 3/5-node StatefulSet (one PVC per pod). See
+  [`docs/storage.md`](docs/storage.md) for the Raft-vs-PostgreSQL rationale.
+- **Backups:** the Raft data lives in the `openbao-data` volume — back it up,
+  and protect your unseal keys/root token.
 - **Least privilege:** create scoped policies + tokens for signing clients
   instead of handing out the root token.
