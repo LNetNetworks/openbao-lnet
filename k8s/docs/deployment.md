@@ -57,11 +57,21 @@ gcloud container clusters get-credentials lnet-privado \
 kubectl config current-context   # → gke_l-net-469615_us-central1-c_lnet-privado
 ```
 
-Herramientas: `gcloud`, `kubectl`, `helm` (solo para el render de verificación),
-`yq` o `python3`, `jq`.
+Herramientas:
+
+| Herramienta | Versión mínima | Por qué |
+|---|---|---|
+| `gcloud` | cualquiera reciente | + `gke-gcloud-auth-plugin` (obligatorio para GKE desde kubectl 1.26) |
+| `kubectl` | **≥ 1.34** | El cluster corre **v1.35.x**. El desfase soportado es ±1 versión menor; con un cliente viejo, `wait`, `cp` y `exec` fallan de formas poco obvias justo en los pasos 5-6. Actualizar con `gcloud components update kubectl` |
+| `helm` | 3.6+ | Solo para el render de verificación. Con helm < 3.10 hay que pasarle `--kube-version 1.31.0`: su versión de capabilities por defecto es menor que el `kubeVersion: >=1.30` del chart |
+| `jq`, `python3` (o `yq`) | — | parsear salidas |
 
 Permisos IAM necesarios sobre `l-net-469615`: `cloudkms.admin`, `iam.serviceAccountAdmin`,
-`storage.admin`, `secretmanager.admin`.
+`storage.admin`, `secretmanager.admin` (`roles/owner` los cubre todos).
+
+APIs que deben estar habilitadas: `cloudkms`, `secretmanager`, `storage`,
+`iamcredentials`, `artifactregistry`, `container`. En `l-net-469615` ya lo están,
+así que el primer bloque de `setup-gcp.sh` no hará nada.
 
 Acceso de escritura a `gitlab.com/lacnet/cloud-infra`.
 
@@ -289,14 +299,37 @@ Crear en Cloudflare, zona `l-net.io`:
 
 | Tipo | Nombre | Contenido | Proxy |
 |------|--------|-----------|-------|
-| A | `vault` | `35.192.128.2` | ver abajo |
+| A | `vault` | `35.192.128.2` | **DNS only (nube gris)** |
 
-**Decisión sobre el proxy (nube naranja):** afecta directamente al
-`ip-restriction`. Si está proxied, Kong ve la IP de Cloudflare y no la del
-cliente, y el allowlist no filtra nada. Leer
-[`kong-ingress.md`](kong-ingress.md) → "El problema de la IP real" antes de
-elegir. Recomendación por defecto: **DNS only (nube gris)** para que el
-allowlist funcione sin configuración extra.
+> ⚠️ **`vault` es la excepción de la zona: va SIN proxy, a propósito.**
+>
+> Todo el resto de `l-net.io` está proxied — `stats`, `api-ppr`, `naas`, `auth`
+> y compañía resuelven a `104.21.35.194` / `172.67.178.218`, IPs del edge de
+> Cloudflare. Y el data plane de Kong **no** tiene `KONG_TRUSTED_IPS` ni
+> `KONG_REAL_IP_HEADER` configurados, así que ve la IP de Cloudflare como IP de
+> origen, nunca la del cliente.
+>
+> Con `vault` proxied, el `KongPlugin/openbao-ip-restriction` compararía CIDRs
+> de oficina contra IPs de Cloudflare y **bloquearía a todo el mundo** (o, si se
+> añadieran los rangos de Cloudflare al allowlist, dejaría pasar a todo internet
+> aparentando que hay control — que es peor).
+>
+> Con **DNS only**, Kong ve la IP real y el allowlist funciona sin tocar nada
+> compartido. El coste: se pierden el WAF de Cloudflare y el ocultamiento de la
+> IP de origen — pero `35.192.128.2` ya es pública para las otras ~40 apps del
+> cluster, así que no se revela nada nuevo.
+>
+> Las alternativas (configurar `real_ip` en Kong para todo el cluster, o mover
+> el allowlist al WAF de Cloudflare) están evaluadas en
+> [`kong-ingress.md`](kong-ingress.md) → "Punto de atención 1".
+
+**Verificación:**
+
+```bash
+dig +short vault.l-net.io
+# 35.192.128.2                     → correcto (DNS only)
+# 104.21.x.x / 172.67.x.x          → está proxied: el allowlist NO funciona
+```
 
 ---
 

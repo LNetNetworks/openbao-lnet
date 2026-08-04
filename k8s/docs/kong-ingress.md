@@ -69,36 +69,63 @@ Con `path: /` y `strip-path: false`, la URL llega íntegra.
 
 ## Punto de atención 1 — la IP real detrás de Cloudflare
 
-**Este es el riesgo principal de la parte de Kong.**
+**Este es el riesgo principal de la parte de Kong, y está confirmado.**
 
-El `KongPlugin/openbao-ip-restriction` filtra por IP de origen. Si el registro
-DNS de `vault.l-net.io` está **proxied** en Cloudflare (nube naranja), la
-conexión que llega a Kong sale de una IP de Cloudflare, no del cliente. El
-allowlist entonces:
-
-- bloquea a todo el mundo (si no incluís los rangos de Cloudflare), o
-- deja pasar a todo el mundo (si los incluís) — que es peor, porque parece que
-  hay control cuando no lo hay.
-
-### Cómo verificarlo
+El `KongPlugin/openbao-ip-restriction` filtra por IP de origen. Pero:
 
 ```bash
-# Desde una IP que NO esté en el allowlist:
-curl -s -o /dev/null -w '%{http_code}\n' https://vault.l-net.io/v1/sys/health
-# 403 → el filtro funciona
-# 200 → Kong está viendo la IP de Cloudflare, el filtro es decorativo
+$ dig +short stats.l-net.io api-ppr.l-net.io naas.l-net.io auth.l-net.io
+104.21.35.194
+172.67.178.218      # ← IPs del edge de Cloudflare, no 35.192.128.2
+...
+
+$ kubectl -n edge-system get deploy gateway-kong \
+    -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}{"\n"}{end}' \
+    | grep -iE 'trusted|real_ip'
+                    # ← vacío: sin KONG_TRUSTED_IPS ni KONG_REAL_IP_HEADER
 ```
 
-El paso 4 de `k8s/scripts/smoke-test.sh` te recuerda hacer esta prueba (no se
-puede automatizar desde la misma máquina que está en el allowlist).
+**Toda la zona `l-net.io` está proxied y Kong no recupera la IP real.** La
+conexión que le llega sale de una IP de Cloudflare, así que un allowlist con
+CIDRs de oficina:
 
-### Las tres salidas
+- bloquea a todo el mundo (si no incluís los rangos de Cloudflare), o
+- deja pasar a todo internet (si los incluís) — que es peor, porque parece que
+  hay control cuando no lo hay.
 
-| Opción | Qué implica |
+### Decisión tomada: `vault` va DNS only
+
+`vault.l-net.io` es **la excepción de la zona**: registro A a `35.192.128.2`
+con la nube **gris**. Así Kong ve la IP real del cliente y el `ip-restriction`
+funciona sin tocar nada compartido.
+
+Lo que se pierde: el WAF de Cloudflare y el ocultamiento de la IP de origen.
+Aceptable, porque `35.192.128.2` ya es pública para las otras ~40 apps del
+cluster — no se revela nada que no estuviera expuesto.
+
+### Las alternativas que se descartaron
+
+| Opción | Por qué no |
 |---|---|
-| **DNS only (nube gris)** — recomendada | Kong ve la IP real y el allowlist funciona sin nada más. Se pierden el WAF y el ocultamiento de la IP de origen de Cloudflare. Para un endpoint con allowlist e IP ya pública (35.192.128.2 lo es para las otras 40 apps) es un intercambio razonable |
-| **Proxied + `real_ip` en Kong** | Configurar `trusted_ips` de Cloudflare y `real_ip_header: X-Forwarded-For` en el data plane de Kong. Es un cambio en `gitops-apps/argocd-applications/kong.yaml` que **afecta a las 45 Ingress del cluster** — coordinar con el equipo de infra, no hacerlo por esta app sola |
-| **Proxied + IP rules de Cloudflare** | Mover el allowlist a Cloudflare (WAF / IP Access Rules) y dejar el `ip-restriction` solo con los CIDRs internos del cluster. Suma el WAF, pero el control queda fuera de GitOps |
+| **Proxied + `real_ip` en Kong** | Es lo correcto a largo plazo (además arreglaría el logging de IPs de *todas* las apps): añadir `KONG_TRUSTED_IPS` con los rangos de Cloudflare y `KONG_REAL_IP_HEADER=X-Forwarded-For` en `cloud-infra/gitops-apps/argocd-applications/kong.yaml`. Se descartó **para este despliegue** porque toca las ~45 Ingress del cluster y exige coordinación con infra — no es un cambio que deba arrastrar la puesta en marcha de un vault. **Si algún día se hace, `vault` puede volver a proxied.** |
+| **Proxied + IP rules de Cloudflare** | Mover el allowlist al WAF de Cloudflare y dejar el `ip-restriction` solo con los CIDRs internos. Suma el WAF, pero saca el control de acceso de GitOps: deja de estar versionado y revisable en un MR |
+
+### Verificación
+
+```bash
+dig +short vault.l-net.io
+# 35.192.128.2              → correcto
+# 104.21.x.x / 172.67.x.x   → está proxied, el allowlist NO filtra
+
+# Y desde una IP que NO esté en el allowlist:
+curl -s -o /dev/null -w '%{http_code}\n' https://vault.l-net.io/v1/sys/health
+# 403 → el filtro funciona
+# 200 → Kong sigue sin ver la IP real
+```
+
+El paso 4 de `k8s/scripts/smoke-test.sh` comprueba lo primero automáticamente y
+te recuerda hacer lo segundo (no se puede automatizar desde la misma máquina que
+está en el allowlist).
 
 ---
 
@@ -112,8 +139,11 @@ recibe HTTP → responde 301 a `https://vault.l-net.io` → Cloudflare vuelve a
 pedir por HTTP → **bucle de redirección**.
 
 Este par de anotaciones es exactamente el que ya usa `stats.l-net.io`
-(`gitops-apps/lnet-stats-dashboard/ingress.yaml`) y funciona, lo que indica que
-la zona está en **Full**. Igual, verificar:
+(`gitops-apps/lnet-stats-dashboard/ingress.yaml`), que está proxied y **no**
+entra en bucle → la zona está en modo **Full**. Además, como `vault` va DNS only
+(punto anterior), Cloudflare ni siquiera está en el camino: el cliente habla
+directo con Kong. Con lo cual este punto no debería dar problemas. Igual,
+verificar:
 
 ```bash
 curl -sI http://vault.l-net.io/v1/sys/health | head -3
@@ -168,10 +198,13 @@ Cosas que uno se pregunta y que están bien:
   debajo de cualquier límite.
 - **Los CRDs `KongPlugin`**: el KIC corre con
   `CONTROLLER_ENABLE_LEGACY_KONG_CRDS=false`, lo que a primera vista parece que
-  los deshabilita. Pero NaaS usa `KongPlugin/jwt-keycloak` en producción
-  (`gitops-apps/naas/base/ingress/`) y funciona, así que la anotación
-  `konghq.com/plugins` sigue siendo el mecanismo válido. Si aun así el plugin no
-  se aplicara, se ve en los logs del KIC (ver abajo).
+  los deshabilita. **Comprobado contra el Admin API de Kong: sí se aplican.** Hay
+  8 plugins configurados con el tag `managed-by-ingress-controller`, todos
+  provenientes de los `KongPlugin/jwt-keycloak` de NaaS. La anotación
+  `konghq.com/plugins` es el mecanismo válido.
+  (La columna `PROGRAMMED` de `kubectl get kongplugin` sale vacía en este
+  cluster — es el KIC que no rellena el status, no que el plugin no exista.
+  Confiar en el Admin API, no en esa columna.)
 - **WebSockets / streaming**: OpenBao no los usa para esta API.
 - **UI de OpenBao**: se sirve en `/ui/` por el mismo listener y pasa por el mismo
   Ingress sin configuración extra.

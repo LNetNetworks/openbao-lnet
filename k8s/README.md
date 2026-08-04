@@ -87,7 +87,7 @@ Cada paso, con sus verificaciones y modos de fallo, en
 
 ---
 
-## Tres cosas que conviene saber antes de tocar nada
+## Cuatro cosas que conviene saber antes de tocar nada
 
 1. **`init-openbao.sh` se corre una sola vez en la vida del cluster.** Correrlo
    sobre PVCs vacíos genera una root key nueva y deja irrecuperables todas las
@@ -98,6 +98,10 @@ Cada paso, con sus verificaciones y modos de fallo, en
 3. **El cluster es zonal** (`us-central1-c`). Esto tolera la caída de un *nodo*,
    no de la *zona*. Ante pérdida de zona la recuperación es restore de snapshot,
    con RPO de hasta 6h.
+4. **`vault.l-net.io` va DNS only en Cloudflare** (nube gris → `35.192.128.2`),
+   al revés que el resto de la zona. Kong no recupera la IP real detrás del
+   proxy de Cloudflare, así que proxied haría inútil el `ip-restriction`.
+   Ver [`docs/kong-ingress.md`](docs/kong-ingress.md) → "Punto de atención 1".
 
 ---
 

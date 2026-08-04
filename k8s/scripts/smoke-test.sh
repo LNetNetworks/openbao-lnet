@@ -91,9 +91,18 @@ fi
 echo
 echo "[3/5] Ingress de Kong"
 # ===========================================================================
-DNS_IP="$(dig +short "${HOST}" | tail -1)"
-echo "      ${HOST} → ${DNS_IP:-<sin resolver>}"
-[[ -n "${DNS_IP}" ]] && pass "DNS resuelve" || fail "DNS no resuelve — falta el registro en Cloudflare"
+KONG_LB="${KONG_LB:-35.192.128.2}"
+DNS_IPS="$(dig +short "${HOST}" | tr '\n' ' ')"
+echo "      ${HOST} → ${DNS_IPS:-<sin resolver>}"
+if [[ -z "${DNS_IPS}" ]]; then
+  fail "DNS no resuelve — falta el registro en Cloudflare"
+elif [[ "${DNS_IPS}" == *"${KONG_LB}"* ]]; then
+  pass "DNS apunta directo al LB de Kong (${KONG_LB}) — DNS only, correcto"
+else
+  # Toda la zona l-net.io está proxied y Kong no recupera la IP real, así que
+  # con vault proxied el ip-restriction compara CIDRs contra IPs de Cloudflare.
+  fail "DNS resuelve a ${DNS_IPS}(Cloudflare) en vez de ${KONG_LB} → el registro está PROXIED: el ip-restriction NO filtra. Ver k8s/docs/kong-ingress.md"
+fi
 
 HTTPS_CODE="$(curl -s -o /dev/null -w '%{http_code}' "${BAO_ADDR}/v1/sys/health" || echo 000)"
 # 200 = activo y desellado. 429/473/501/503 = otros estados de sys/health.
@@ -122,25 +131,39 @@ fi
 echo
 echo "[4/5] ip-restriction — ¿Kong ve tu IP o la de Cloudflare?"
 # ===========================================================================
-# Este es el riesgo #1 de la parte de Kong: si el registro DNS está proxied
-# (nube naranja), Kong ve una IP de Cloudflare y el allowlist no filtra nada
-# útil. La comprobación: pedir con una IP de origen que NO está en la lista y
-# ver si Kong responde 403.
+# Riesgo #1 de la parte de Kong: el data plane NO tiene KONG_TRUSTED_IPS ni
+# KONG_REAL_IP_HEADER, así que si el registro DNS estuviera proxied Kong vería
+# una IP de Cloudflare y el allowlist no filtraría nada. El paso [3/5] ya
+# comprueba que el DNS apunta directo al LB; acá se verifica el efecto real.
 MY_IP="$(curl -s https://ifconfig.me 2>/dev/null || echo '?')"
 echo "      tu IP pública: ${MY_IP}"
 echo "      allowlist actual del KongPlugin:"
 kubectl -n "${NAMESPACE}" get kongplugin openbao-ip-restriction \
   -o jsonpath='{.config.allow}' 2>/dev/null | sed 's/^/        /' || warn "no se pudo leer el KongPlugin"
 echo
+
+# ¿El plugin llegó realmente a la config de Kong? La columna PROGRAMMED de
+# `kubectl get kongplugin` sale vacía en este cluster, así que se consulta el
+# Admin API, que es la fuente de verdad.
+IN_KONG="$(kubectl -n edge-system run kong-probe-$$ --rm -i --restart=Never \
+  --image=curlimages/curl:8.10.1 --quiet -- \
+  curl -s http://gateway-kong-admin.edge-system.svc.cluster.local:8001/plugins 2>/dev/null \
+  | grep -c "k8s-name:openbao-ip-restriction" || true)"
+if [[ "${IN_KONG:-0}" -gt 0 ]]; then
+  pass "el ip-restriction está aplicado en Kong (visto en el Admin API)"
+else
+  fail "el ip-restriction NO aparece en la config de Kong — revisá los logs del KIC"
+fi
+
 cat <<'EOF'
+
       VERIFICACIÓN MANUAL (no se puede automatizar desde acá):
       pedí a alguien con una IP NO incluida en la allowlist que corra:
 
           curl -s -o /dev/null -w '%{http_code}\n' https://vault.l-net.io/v1/sys/health
 
-      Debe devolver 403. Si devuelve 200, el ip-restriction está viendo la IP
-      de Cloudflare y no la del cliente → k8s/docs/kong-ingress.md, sección
-      "El problema de la IP real".
+      Debe devolver 403. Si devuelve 200, Kong no está viendo la IP real del
+      cliente → k8s/docs/kong-ingress.md, "Punto de atención 1".
 EOF
 
 # ===========================================================================

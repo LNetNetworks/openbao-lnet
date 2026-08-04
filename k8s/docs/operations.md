@@ -301,6 +301,11 @@ Honestidad sobre los límites, para que nadie asuma de más:
   aplicación.
 - **Replicación entre regiones.** Es una feature Enterprise de Vault que OpenBao
   no tiene. La alternativa es snapshots + restore.
+- **WAF.** `vault.l-net.io` va DNS only para que el `ip-restriction` vea la IP
+  real, así que **no pasa por el WAF de Cloudflare** ni por su mitigación de
+  DDoS. La defensa de borde es el allowlist + rate limiting de Kong. Si algún
+  día se configura `real_ip` en el data plane de Kong (afecta a todo el
+  cluster), `vault` puede volver a proxied y recuperar el WAF.
 
 ---
 

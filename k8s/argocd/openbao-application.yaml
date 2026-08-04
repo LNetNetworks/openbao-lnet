@@ -305,11 +305,20 @@ spec:
           # ⚠️ ANTES DE SINCRONIZAR: reemplazar los CIDRs de ejemplo por los
           # reales (oficina/VPN + rangos de los consumidores).
           #
-          # ⚠️ Si el registro DNS de vault.l-net.io está PROXIED en Cloudflare
-          # (nube naranja), Kong ve la IP de Cloudflare y no la del cliente →
-          # este plugin bloquearía a todo el mundo o a nadie. Verificarlo con el
-          # paso 4 de k8s/scripts/smoke-test.sh antes de confiar en él.
-          # Detalle y alternativas en k8s/docs/kong-ingress.md.
+          # ⚠️ ESTE PLUGIN EXIGE QUE vault.l-net.io SEA "DNS only" EN CLOUDFLARE
+          # (nube gris, A → 35.192.128.2).
+          #
+          # Comprobado en el cluster: toda la zona l-net.io está proxied
+          # (stats/api-ppr/naas/auth resuelven a 104.21.35.194 y 172.67.178.218)
+          # y el data plane de Kong NO tiene KONG_TRUSTED_IPS ni
+          # KONG_REAL_IP_HEADER. Con vault proxied, Kong compararía estos CIDRs
+          # contra IPs de Cloudflare → bloquearía a todo el mundo (o, si se
+          # añadieran los rangos de Cloudflare, dejaría pasar a todo internet
+          # aparentando que hay control).
+          #
+          # Con DNS only, Kong ve la IP real y esto funciona sin tocar nada
+          # compartido. Detalle y alternativas descartadas:
+          # k8s/docs/kong-ingress.md → "Punto de atención 1".
           - apiVersion: configuration.konghq.com/v1
             kind: KongPlugin
             metadata:
