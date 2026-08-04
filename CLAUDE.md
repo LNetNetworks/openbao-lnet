@@ -83,31 +83,64 @@ Sign payload fields: `to` (omit to deploy a contract), `data` (hex `0x…`),
 `value`, `nonce` (hex string, e.g. `"0x0"`), `gas`, `gasPrice`, `chainId`
 (EIP-155 — e.g. LACChain networks). Auth header on every call: `X-Vault-Token: $BAO_TOKEN`.
 
-## Production & DR (planned, not implemented)
+## Production on Kubernetes — `k8s/` (implemented)
 
-The POC runs single-node with manual Shamir unseal, but the production/Kubernetes
-path is designed and documented (Spanish):
+Production runs on **GKE `lnet-privado`** (`l-net-469615`, us-central1-c),
+published at **`https://vault.l-net.io`**. Everything lives under
+[`k8s/`](k8s/README.md); the step-by-step is
+[`k8s/docs/deployment.md`](k8s/docs/deployment.md).
 
-- [`docs/storage.md`](docs/storage.md) — storage backend decision: **Raft**
-  (chosen) vs Cloud SQL PostgreSQL, with the durability/backup analysis. Key
-  insights it establishes: the backend only stores **encrypted blobs** (what
-  prevents key loss is unseal-key custody + OpenBao snapshots, backend-independent);
-  and the **RPO** distinction — backups do NOT contain a key created seconds ago;
-  only **live replication** (Raft quorum / Cloud SQL sync HA) does, giving RPO≈0
-  for node/zone failure. App-level mitigation: pre-generate a pool of addresses.
-- [`docs/dr-plan.md`](docs/dr-plan.md) — **a plan, not implemented**: auto-unseal
-  with Cloud KMS + a CronJob taking `raft snapshot save` to GCS. Config blocks
-  there are illustrative sketches, not deploy-ready manifests.
-- [`docs/throughput.md`](docs/throughput.md) — high-volume signing. Two
-  non-obvious truths: **HA ≠ throughput** (only the active node serves requests;
-  add nodes for failover, not TPS) and the real bottleneck is **nonce
-  coordination** — `ethsign` does NOT manage nonces, the client must serialize
-  them per account. Scale vertically + shard accounts, never add cluster nodes for
-  read throughput.
+Shape: OpenBao Helm chart `0.28.6` (appVersion `v2.6.1`, repo
+`https://openbao.github.io/openbao-helm`) → StatefulSet of 3 Raft nodes, one
+`data` + one `audit` PVC per pod, **auto-unseal via Cloud KMS**, Ingress through
+the existing Kong, snapshots to GCS every 6h.
 
-If asked to "set up production" or "implement DR", start from these two docs —
-they hold the rationale and the intended shape (3/5-node StatefulSet, one PVC per
-pod, KMS auto-unseal, snapshot CronJob).
+**Deploy model.** One ArgoCD `Application` with the chart + inline
+`helm.valuesObject` — the same pattern as `kong.yaml` and
+`kube-prometheus-stack.yaml` in `cloud-infra` (ArgoCD has no `--enable-helm`, so
+Kustomize `helmCharts` is not an option). `k8s/argocd/openbao-application.yaml`
+is **the only file copied** into
+`cloud-infra/gitops-apps/argocd-applications/openbao.yaml`.
+
+**Things that bite (all documented, but worth knowing here):**
+
+- `disable_mlock = true` is **mandatory**: the chart runs as uid 100 with
+  `SKIP_SETCAP=true`, so `mlock()` would fail.
+- `plugin_directory = "/openbao/plugins"` must be in the HCL — the chart doesn't
+  add it and `bao plugin register` fails without it.
+- `storage "raft"` does **not** accept an `autopilot { }` block (only
+  `autopilot_reconcile_interval`/`_update_interval`). Autopilot is set via API in
+  `k8s/scripts/bootstrap-auth.sh`.
+- The Ingress points at the `openbao-active` Service (`activeService: true`), not
+  the round-robin one — writes only go to the Raft leader, avoiding 307s.
+- Pods sit at **`0/1 Ready` until `operator init`** — expected, same as the POC
+  (`bao status` exits 2).
+- With KMS auto-unseal, `operator init` yields **recovery keys**, not Shamir
+  unseal keys. They don't unseal; they regenerate the root token.
+  **Destroying the KMS key closes the vault permanently** — recovery keys don't help.
+- The cluster is **zonal**: 3 replicas tolerate node loss, **not zone loss**.
+  Zone loss ⇒ snapshot restore, RPO up to 6h.
+- CI builds the image automatically but **the tag bump is a manual job** —
+  a stateful vault must not roll on every commit.
+
+### Background docs (Spanish, the rationale)
+
+- [`docs/storage.md`](docs/storage.md) — why **Raft** over Cloud SQL PostgreSQL.
+  Key insights: the backend only stores **encrypted blobs** (what prevents key
+  loss is unseal-key custody + snapshots, backend-independent); and the **RPO**
+  distinction — backups do NOT contain a key created seconds ago, only live
+  replication does. App-level mitigation: pre-generate a pool of addresses.
+  ⚠️ Its "RPO≈0 for zone failure" claim assumes a *regional* cluster; the real
+  one is zonal — corrected in-doc.
+- [`docs/dr-plan.md`](docs/dr-plan.md) — was the DR plan, **now implemented**;
+  header maps each part to the file that implements it.
+- [`docs/throughput.md`](docs/throughput.md) — **HA ≠ throughput** (only the
+  active node serves requests; add nodes for failover, not TPS) and the real
+  bottleneck is **nonce coordination** — `ethsign` does NOT manage nonces, the
+  client must serialize them per account. Scale vertically + shard accounts.
+
+If asked to change the production deployment, edit under `k8s/` — never hand-edit
+the copy in `cloud-infra` without syncing it back.
 
 ## HA cluster (local, for learning only)
 
@@ -121,8 +154,13 @@ init ONE node, unseal all three with the **same** key (joins are auto via
 ## Docs
 
 `README.md` (English) and `docs/quickstart.md` (Spanish, based on a real POC run)
-are the authoritative references — keep them in sync when changing the lifecycle,
-scripts, or API. `docs/storage.md` and `docs/dr-plan.md` cover the production/DR
-architecture (see the section above). `docs/CONFIGURE.md` is the reference for all
-config knobs — build args (`ETHSIGN_REF` = pinned plugin commit, `OPENBAO_VERSION`),
-`openbao.hcl` keys, and compose options.
+are the authoritative references **for the local POC** — keep them in sync when
+changing the lifecycle, scripts, or API. `docs/CONFIGURE.md` is the reference for
+all config knobs — build args (`ETHSIGN_REF` = pinned plugin commit,
+`OPENBAO_VERSION`), `openbao.hcl` keys, and compose options.
+
+For **production on Kubernetes**, the authoritative set is under `k8s/docs/`:
+`deployment.md` (step by step), `unseal-keys.md` (key custody, rotation, disaster
+scenarios), `kong-ingress.md` (the edge and its three gotchas), `operations.md`
+(runbook: failover, restore, upgrades, scaling). `docs/storage.md` and
+`docs/dr-plan.md` hold the rationale behind those choices.

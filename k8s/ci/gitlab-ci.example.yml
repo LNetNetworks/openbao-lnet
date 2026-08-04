@@ -1,0 +1,155 @@
+# =============================================================================
+# Pipeline de GitLab para openbao-lnet-storage
+# =============================================================================
+#
+# Copiar a `.gitlab-ci.yml` en la raíz del repo cuando esté en GitLab.
+#
+# DIFERENCIA IMPORTANTE con el resto de las apps del grupo: acá el deploy NO es
+# automático.
+#
+# Las demás apps usan `backend-docker-argocd-single-env.yml`, que en cada push a
+# main construye la imagen Y commitea el tag nuevo en cloud-infra → ArgoCD hace
+# rolling update solo. Para un vault eso está mal: cada rollout reinicia los 3
+# pods de un StatefulSet con estado, provoca failovers de Raft y corta las
+# firmas en vuelo. Un commit de documentación no debería mover el vault.
+#
+# Entonces:
+#   - `build`          → automático en main. Construye y publica la imagen.
+#   - `bump-image-tag` → MANUAL. Es el que efectivamente despliega.
+#
+# Además, `update-deployment.yml` del template central solo sabe parchear
+# `images[].newTag` de un kustomization.yaml. OpenBao se despliega como una
+# Application de Helm, así que el bump se hace acá con `yq` sobre
+# `.spec.source.helm.valuesObject.server.image.tag`.
+#
+# -----------------------------------------------------------------------------
+# Variables a configurar en Settings → CI/CD → Variables del proyecto:
+#
+#   IMAGE                us-central1-docker.pkg.dev/l-net-469615/l-net-docker-repo/openbao-ethsign
+#   GCP_PROJECT_ID       l-net-469615
+#   WIF_PROVIDER         projects/<num>/locations/global/workloadIdentityPools/gitlab/providers/gitlab-oidc
+#   WIF_SERVICE_ACCOUNT  gitlab-ci-deployer@l-net-469615.iam.gserviceaccount.com
+#   GITLAB_PAT           token con write_repository sobre lacnet/cloud-infra
+#
+# Y hay que dar de alta este repo en el `attribute-condition` del provider WIF
+# `gitlab-oidc` (ver cloud-infra/CLAUDE.md → Pipelines CI/CD).
+# =============================================================================
+
+include:
+  # Solo el paso de build. NO se incluye el template completo: ese arrastra
+  # `update-deployment`, que es justo lo que no queremos automático.
+  - project: 'lacnet/gitlab-pipelines'
+    file: '/templates/steps/build-docker-image.yml'
+    ref: 'main'
+  - project: 'lacnet/gitlab-pipelines'
+    file: '/templates/steps/validate-dockerfile.yml'
+    ref: 'main'
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_MESSAGE =~ /\[skip ci\]/ || $CI_COMMIT_MESSAGE =~ /\[ci skip\]/'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+stages:
+  - validate
+  - build
+  - deploy
+
+variables:
+  # Debe coincidir con el appVersion del chart declarado en
+  # k8s/argocd/openbao-application.yaml (targetRevision 0.28.6 → v2.6.1).
+  # Si divergen, el binario del servidor y los defaults del chart se desalinean.
+  OPENBAO_VERSION: "2.6.1"
+
+# -----------------------------------------------------------------------------
+# build — automático. Publica la imagen; NO despliega nada.
+# -----------------------------------------------------------------------------
+build:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - Dockerfile
+        - config/**/*
+        - scripts/**/*
+  variables:
+    # El template pasa los build-args al `docker build`.
+    DOCKER_BUILD_ARGS: "--build-arg OPENBAO_VERSION=${OPENBAO_VERSION}"
+
+# -----------------------------------------------------------------------------
+# bump-image-tag — MANUAL. Este job ES el deploy.
+#
+# Antes de correrlo:
+#   1. Tomar un snapshot:  BAO_TOKEN=... ./k8s/scripts/snapshot.sh
+#   2. Avisar: el rollout provoca uno o dos failovers de Raft.
+# -----------------------------------------------------------------------------
+bump-image-tag:
+  stage: deploy
+  image: alpine:latest
+  tags:
+    - lnet-global-runner
+  when: manual
+  allow_failure: false
+  needs:
+    - job: build
+      optional: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  before_script:
+    - apk add --no-cache git curl yq
+    - export GITLAB_PAT="${GITLAB_PAT:-${CI_JOB_TOKEN}}"
+    - git clone --depth=1 https://oauth2:${GITLAB_PAT}@gitlab.com/lacnet/cloud-infra.git /tmp/cloud-infra
+    - cd /tmp/cloud-infra
+    - git config user.email "ci-pipeline@lacnet.com"
+    - git config user.name "GitLab CI Pipeline"
+  script:
+    - |
+      set -euo pipefail
+      APP_FILE="gitops-apps/argocd-applications/openbao.yaml"
+      IMAGE_TAG="$CI_COMMIT_SHORT_SHA"
+
+      if [ ! -f "$APP_FILE" ]; then
+        echo "No existe $APP_FILE en cloud-infra."
+        echo "Primer despliegue: copiar k8s/argocd/openbao-application.yaml a mano."
+        exit 1
+      fi
+
+      PREVIOUS_TAG="$(yq '.spec.source.helm.valuesObject.server.image.tag' "$APP_FILE")"
+      echo "tag actual: ${PREVIOUS_TAG} → nuevo: ${IMAGE_TAG}"
+
+      if [ "$PREVIOUS_TAG" = "$IMAGE_TAG" ]; then
+        echo "Ya está en ese tag — nada que hacer."
+        exit 0
+      fi
+
+      yq -i ".spec.source.helm.valuesObject.server.image.tag = \"${IMAGE_TAG}\"" "$APP_FILE"
+      git add "$APP_FILE"
+
+      git commit -m "$(printf 'chore(prod): deploy openbao %s\n\nService: %s\nImage: %s:%s\nPrevious-tag: %s\nSource-commit: %s - %s\nPipeline: %s\nTriggered-by: %s (%s)' \
+        "$IMAGE_TAG" "$CI_PROJECT_PATH" "$IMAGE" "$IMAGE_TAG" "$PREVIOUS_TAG" \
+        "$CI_COMMIT_SHORT_SHA" "$CI_COMMIT_TITLE" "$CI_PIPELINE_URL" \
+        "$GITLAB_USER_NAME" "$GITLAB_USER_EMAIL")"
+
+      git push https://oauth2:${GITLAB_PAT}@gitlab.com/lacnet/cloud-infra.git main
+      echo "cloud-infra actualizado. ArgoCD sincroniza en su próximo poll (~3 min)."
+
+      if [ -n "${ARGOCD_TOKEN:-}" ] && [ -n "${ARGOCD_URL:-}" ]; then
+        curl -s -X POST "${ARGOCD_URL}/api/v1/applications/openbao/sync" \
+          -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d '{"dryRun":false,"strategy":{"type":"sync"}}' \
+          && echo "sync disparado" || echo "sync falló (no bloqueante)"
+      fi
+  environment:
+    name: production
+    url: https://vault.l-net.io
+
+# -----------------------------------------------------------------------------
+# Recordatorio post-deploy: si cambió el BINARIO del plugin ethsign, el sha256
+# registrado en el catálogo ya no coincide y hay que volver a registrarlo:
+#
+#   BAO_TOKEN=... ./k8s/scripts/register-plugin.sh
+#
+# (el script es idempotente; detecta que el mount ya existe y solo re-registra)
+# -----------------------------------------------------------------------------

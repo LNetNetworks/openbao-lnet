@@ -1,0 +1,173 @@
+# =============================================================================
+# Snapshots automáticos de Raft → gs://lnet-openbao-snapshots
+# =============================================================================
+#
+# Implementa la "Parte 2" de docs/dr-plan.md, que hasta ahora era un boceto.
+#
+# Por qué NO se usa el `snapshotAgent` que trae el chart:
+# ese agente sube por S3 y con GCS eso obliga a generar claves HMAC de
+# interoperabilidad — un secreto de larga vida que Workload Identity justamente
+# nos ahorra. Acá el pod se autentica con su ServiceAccount contra GCP (WI) y
+# contra OpenBao (método kubernetes auth). No hay ningún token estático.
+#
+# Cómo aplicarlo:
+#   a) directo:   kubectl apply -f k8s/backup/snapshot-cronjob.yaml
+#   b) GitOps:    pegar estos dos objetos en `extraObjects` del
+#                 k8s/argocd/openbao-application.yaml (recomendado a mediano
+#                 plazo — así ArgoCD también los reconcilia)
+#
+# REQUISITO PREVIO: k8s/scripts/bootstrap-auth.sh debe haber creado el rol
+# `snapshot` del método de auth de Kubernetes.
+#
+# RPO: cada 6 horas. Una llave creada 10 minutos antes de perder la zona NO
+# está en el último snapshot — ese es el matiz que explica docs/storage.md.
+# La mitigación a nivel de aplicación (pre-generar un pool de addresses) sigue
+# siendo la más efectiva.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openbao-snapshot
+  namespace: openbao
+  annotations:
+    # Mismo GSA que los servidores: ya tiene objectAdmin sobre el bucket.
+    # El binding de Workload Identity lo crea k8s/gcp/setup-gcp.sh.
+    iam.gke.io/gcp-service-account: openbao-kms@l-net-469615.iam.gserviceaccount.com
+  labels:
+    app.kubernetes.io/name: openbao
+    app.kubernetes.io/component: snapshot
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: openbao-snapshot
+  namespace: openbao
+  labels:
+    app.kubernetes.io/name: openbao
+    app.kubernetes.io/component: snapshot
+spec:
+  # Cada 6 horas. Subirlo a */30 si el RPO de 6h no alcanza — el coste es
+  # despreciable (los snapshots de este vault pesan pocos MB).
+  schedule: "0 */6 * * *"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # Si un snapshot tarda más de 15 min, algo anda mal.
+      activeDeadlineSeconds: 900
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: openbao
+            app.kubernetes.io/component: snapshot
+        spec:
+          serviceAccountName: openbao-snapshot
+          restartPolicy: OnFailure
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+
+          containers:
+            - name: snapshot
+              # Trae gcloud y curl. No necesitamos el binario `bao`: el snapshot
+              # se pide por HTTP a /v1/sys/storage/raft/snapshot.
+              image: google/cloud-sdk:slim
+              imagePullPolicy: IfNotPresent
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false
+                capabilities:
+                  drop: ["ALL"]
+
+              env:
+                # `openbao-active` = Service que apunta solo al líder de Raft.
+                # El snapshot hay que pedirlo al líder.
+                - name: BAO_ADDR
+                  value: "http://openbao-active.openbao.svc.cluster.local:8200"
+                - name: BUCKET
+                  value: "lnet-openbao-snapshots"
+                - name: BAO_ROLE
+                  value: "snapshot"
+
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+
+                  TS="$(date -u '+%Y%m%dT%H%M%SZ')"
+                  DAY="$(date -u '+%Y/%m/%d')"
+                  OUT="/work/openbao-${TS}.snap"
+
+                  echo "==> Login en OpenBao con el JWT del ServiceAccount"
+                  # Token proyectado del pod. El método kubernetes auth lo valida
+                  # con TokenReview contra la API — sin credenciales guardadas.
+                  JWT="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+
+                  LOGIN="$(curl -sS --fail-with-body \
+                    --request POST \
+                    --data "{\"role\":\"${BAO_ROLE}\",\"jwt\":\"${JWT}\"}" \
+                    "${BAO_ADDR}/v1/auth/kubernetes/login")"
+
+                  TOKEN="$(echo "${LOGIN}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["auth"]["client_token"])')"
+                  if [ -z "${TOKEN}" ]; then
+                    echo "No se obtuvo token. ¿Existe el rol '${BAO_ROLE}'? (bootstrap-auth.sh)" >&2
+                    exit 1
+                  fi
+
+                  echo "==> Pidiendo el snapshot al líder"
+                  curl -sS --fail-with-body \
+                    --header "X-Vault-Token: ${TOKEN}" \
+                    --output "${OUT}" \
+                    "${BAO_ADDR}/v1/sys/storage/raft/snapshot"
+
+                  SIZE="$(stat -c %s "${OUT}")"
+                  echo "    ${SIZE} bytes"
+                  # Un snapshot vacío/truncado subido en silencio es peor que no
+                  # tener backup: da falsa sensación de cobertura.
+                  if [ "${SIZE}" -lt 1024 ]; then
+                    echo "Snapshot sospechosamente chico (${SIZE} bytes). Abortando." >&2
+                    exit 1
+                  fi
+                  # Los snapshots de Raft son gzip; si no lo es, algo salió mal.
+                  if ! gzip -t "${OUT}" 2>/dev/null; then
+                    echo "El archivo no es un gzip válido — snapshot corrupto." >&2
+                    exit 1
+                  fi
+
+                  echo "==> Subiendo a gs://${BUCKET}/auto/${DAY}/"
+                  gcloud storage cp "${OUT}" "gs://${BUCKET}/auto/${DAY}/openbao-${TS}.snap"
+
+                  echo "==> Revocando el token de OpenBao"
+                  curl -sS --request POST \
+                    --header "X-Vault-Token: ${TOKEN}" \
+                    "${BAO_ADDR}/v1/auth/token/revoke-self" || true
+
+                  rm -f "${OUT}"
+                  echo "==> OK: gs://${BUCKET}/auto/${DAY}/openbao-${TS}.snap"
+
+          volumes:
+            # emptyDir y no el PVC de datos: no inflamos el volumen de Raft.
+            - name: work
+              emptyDir:
+                sizeLimit: 2Gi

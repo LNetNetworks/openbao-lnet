@@ -1,0 +1,363 @@
+# =============================================================================
+# OpenBao — cluster Raft HA de 3 nodos en GKE `lnet-privado` (l-net-469615)
+# =============================================================================
+#
+# ESTE ES EL ÚNICO ARCHIVO QUE SE COPIA A cloud-infra:
+#   cloud-infra/gitops-apps/argocd-applications/openbao.yaml
+# y se añade a `gitops-apps/argocd-applications/kustomization.yaml`.
+# La Application `apps-root` lo sincroniza automáticamente.
+#
+# Sigue el patrón de las demás apps Helm del repo (kong.yaml,
+# platform/monitoring/kube-prometheus-stack.yaml): una sola `source` apuntando
+# al repo Helm upstream, con los values inline en `valuesObject`.
+#
+# Ver k8s/docs/deployment.md para el procedimiento completo de despliegue.
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: openbao
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  destination:
+    namespace: openbao
+    server: https://kubernetes.default.svc
+
+  source:
+    repoURL: https://openbao.github.io/openbao-helm
+    chart: openbao
+    # Pin al patch exacto. Subir de versión = editar este número a mano y
+    # revisar el CHANGELOG del chart (el StatefulSet es stateful: un cambio
+    # silencioso de defaults puede forzar recreación de PVCs).
+    targetRevision: 0.28.6
+
+    helm:
+      releaseName: openbao
+
+      valuesObject:
+        global:
+          enabled: true
+          # TLS lo termina Cloudflare delante de Kong; dentro del cluster el
+          # tráfico es HTTP. Cambiar esto implica emitir certs para el listener
+          # y para el puerto de cluster (8201) de Raft.
+          tlsDisable: true
+
+        # El injector es el sidecar de HashiCorp (vault-k8s). No lo usamos: los
+        # consumidores hablan con la API REST directamente.
+        injector:
+          enabled: false
+
+        # Tampoco el CSI provider.
+        csi:
+          enabled: false
+
+        # `ui.enabled` crea un Service extra para la UI. No hace falta: la UI se
+        # sirve por el mismo listener 8200 gracias a `ui = true` en el HCL de
+        # abajo, y ya está publicada por el Ingress.
+        ui:
+          enabled: false
+
+        server:
+          # -------------------------------------------------------------------
+          # Imagen: OpenBao + plugin ethsign compilado (ver Dockerfile del repo)
+          # -------------------------------------------------------------------
+          image:
+            registry: us-central1-docker.pkg.dev
+            repository: l-net-469615/l-net-docker-repo/openbao-ethsign
+            # ↓↓↓ ESTE es el campo que bumpea el job manual del pipeline ↓↓↓
+            tag: "REPLACE_ME"
+            pullPolicy: IfNotPresent
+
+          logLevel: info
+          logFormat: json
+
+          # El default del chart es OnDelete (obliga a borrar pods a mano en cada
+          # upgrade). Con auto-unseal por KMS el rolling es seguro: el pod nuevo
+          # arranca desellado solo y hace retry_join.
+          updateStrategyType: RollingUpdate
+          # De a un pod por vez — nunca perder quórum durante un rollout.
+          podManagementPolicy: OrderedReady
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+
+          # -------------------------------------------------------------------
+          # Almacenamiento — un PVC por pod (StatefulSet volumeClaimTemplates)
+          # -------------------------------------------------------------------
+          dataStorage:
+            enabled: true
+            size: 10Gi
+            mountPath: /openbao/data
+            storageClass: standard-rwo
+            accessMode: ReadWriteOnce
+
+          # Audit log en disco. Para un vault que custodia llaves privadas el
+          # audit device no es opcional. Se habilita en bootstrap-auth.sh.
+          auditStorage:
+            enabled: true
+            size: 10Gi
+            mountPath: /openbao/audit
+            storageClass: standard-rwo
+            accessMode: ReadWriteOnce
+
+          # Retener los PVCs aunque se borre el StatefulSet: son los datos.
+          persistentVolumeClaimRetentionPolicy:
+            whenDeleted: Retain
+            whenScaled: Retain
+
+          # -------------------------------------------------------------------
+          # ServiceAccount + Workload Identity → GSA con permiso sobre la KMS key
+          # -------------------------------------------------------------------
+          serviceAccount:
+            create: true
+            name: openbao
+            annotations:
+              iam.gke.io/gcp-service-account: openbao-kms@l-net-469615.iam.gserviceaccount.com
+
+          # El SDK de Google resuelve las credenciales por ADC (Workload
+          # Identity). No hay archivo de credenciales ni secret montado.
+          extraEnvironmentVars:
+            GOOGLE_PROJECT: l-net-469615
+            GOOGLE_REGION: global
+
+          # -------------------------------------------------------------------
+          # Probes
+          # -------------------------------------------------------------------
+          # readiness: exec `bao status` (exit 0 = unsealed, 2 = sealed).
+          # Antes del `operator init` los 3 pods quedan 0/1 Ready — es lo esperado.
+          readinessProbe:
+            enabled: true
+            failureThreshold: 2
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            successThreshold: 1
+            timeoutSeconds: 3
+
+          # liveness con standbyok: un standby sano NO debe reiniciarse.
+          livenessProbe:
+            enabled: true
+            path: /v1/sys/health?standbyok=true
+            port: 8200
+            failureThreshold: 5
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+
+          # Dar tiempo a step-down + drenaje de conexiones antes del SIGKILL.
+          terminationGracePeriodSeconds: 30
+          preStopSleepSeconds: 10
+
+          # -------------------------------------------------------------------
+          # Ingress vía Kong  →  https://vault.l-net.io
+          # -------------------------------------------------------------------
+          # activeService: true hace que el backend sea el Service
+          # `openbao-active` (selector openbao-active=true), NO el Service que
+          # balancea a los 3 pods. Así todo el tráfico va al líder de Raft y no
+          # dependemos del request-forwarding entre nodos.
+          # NO lleva bloque `tls:`: el secret kong-cloudflare-cert (origin cert
+          # de Cloudflare, SAN *.l-net.io) ya lo sirve Kong globalmente.
+          ingress:
+            enabled: true
+            ingressClassName: kong
+            activeService: true
+            pathType: Prefix
+            annotations:
+              konghq.com/protocols: https,http
+              konghq.com/https-redirect-status-code: "301"
+              konghq.com/strip-path: "false"
+              konghq.com/plugins: openbao-ip-restriction,openbao-rate-limiting
+            hosts:
+              - host: vault.l-net.io
+                paths:
+                  - /
+
+          # -------------------------------------------------------------------
+          # Alta disponibilidad — Integrated Storage (Raft)
+          # -------------------------------------------------------------------
+          ha:
+            enabled: true
+            replicas: 3
+
+            raft:
+              enabled: true
+              # node_id = nombre del pod (openbao-0/1/2) en vez de un uuid.
+              setNodeId: true
+
+              config: |
+                ui = true
+
+                # OBLIGATORIO: el chart corre como uid 100 con SKIP_SETCAP=true,
+                # así que el proceso no tiene CAP_IPC_LOCK y mlock() fallaría.
+                disable_mlock = true
+
+                # Directorio con el binario del plugin ethsign (viene baked en
+                # la imagen, /openbao/plugins/ethsign, modo 755). Sin esta línea
+                # `bao plugin register` falla con "no such file or directory".
+                plugin_directory = "/openbao/plugins"
+
+                listener "tcp" {
+                  address         = "[::]:8200"
+                  cluster_address = "[::]:8201"
+                  tls_disable     = 1
+
+                  telemetry {
+                    # Necesario para que el ServiceMonitor scrapee /v1/sys/metrics
+                    # sin token.
+                    unauthenticated_metrics_access = true
+                  }
+                }
+
+                storage "raft" {
+                  path = "/openbao/data"
+
+                  # Auto-join por DNS del headless service. Cada pod intenta con
+                  # los tres y se ignora a sí mismo. Tras el `operator init` en
+                  # openbao-0, los otros dos se unen solos.
+                  retry_join {
+                    leader_api_addr = "http://openbao-0.openbao-internal:8200"
+                  }
+                  retry_join {
+                    leader_api_addr = "http://openbao-1.openbao-internal:8200"
+                  }
+                  retry_join {
+                    leader_api_addr = "http://openbao-2.openbao-internal:8200"
+                  }
+
+                  # OJO: `storage "raft"` NO acepta un bloque `autopilot { }`
+                  # (solo autopilot_reconcile_interval / autopilot_update_interval).
+                  # El cleanup de nodos muertos y min_quorum se configuran por API:
+                  #   bao operator raft autopilot set-config ...
+                  # Lo hace k8s/scripts/bootstrap-auth.sh.
+                }
+
+                # AUTO-UNSEAL. La root key la protege Cloud KMS: los pods
+                # arrancan desellados solos tras cualquier restart o rollout.
+                # `bao operator init` con este seal devuelve RECOVERY KEYS
+                # (no unseal keys Shamir) — ver k8s/docs/unseal-keys.md.
+                # Credenciales por Workload Identity (ADC), sin archivo JSON.
+                seal "gcpckms" {
+                  project    = "l-net-469615"
+                  region     = "global"
+                  key_ring   = "openbao-unseal"
+                  crypto_key = "openbao-unseal-key"
+                }
+
+                # Mantiene la label openbao-active=true en el pod líder, que es lo
+                # que selecciona el Service `openbao-active` del Ingress.
+                service_registration "kubernetes" {}
+
+                telemetry {
+                  prometheus_retention_time = "30s"
+                  disable_hostname          = true
+                }
+
+            # Con 3 réplicas → maxUnavailable = 1. Impide que un drain de nodos
+            # tumbe el quórum.
+            disruptionBudget:
+              enabled: true
+
+          # podAntiAffinity requerido por hostname (default del chart): un pod
+          # de OpenBao por nodo. El node pool autoescala 2→5, así que si solo
+          # hay 2 nodos el tercer pod queda Pending hasta que suba el nodo.
+          # OJO: el cluster es ZONAL (us-central1-c) — esto tolera caída de
+          # NODO, no de zona. Ver k8s/docs/operations.md.
+          affinity: |
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: {{ template "openbao.name" . }}
+                      app.kubernetes.io/instance: "{{ .Release.Name }}"
+                      component: server
+                  topologyKey: kubernetes.io/hostname
+
+        # ---------------------------------------------------------------------
+        # Métricas — kube-prometheus-stack descubre ServiceMonitors solo en
+        # namespaces con la label `monitoring: enabled` (ver managedNamespace-
+        # Metadata más abajo) y con la label de release en el propio recurso.
+        # ---------------------------------------------------------------------
+        serverTelemetry:
+          serviceMonitor:
+            enabled: true
+            interval: 30s
+            scrapeTimeout: 10s
+            selectors:
+              release: kube-prometheus-stack
+
+        # ---------------------------------------------------------------------
+        # Objetos extra que el chart renderiza tal cual: los plugins de Kong.
+        # Van acá (y no en un repo Kustomize aparte) para que toda la app sea
+        # una sola Application de ArgoCD.
+        # ---------------------------------------------------------------------
+        extraObjects:
+          # Allowlist de IPs con acceso a la API de firma.
+          #
+          # ⚠️ ANTES DE SINCRONIZAR: reemplazar los CIDRs de ejemplo por los
+          # reales (oficina/VPN + rangos de los consumidores).
+          #
+          # ⚠️ Si el registro DNS de vault.l-net.io está PROXIED en Cloudflare
+          # (nube naranja), Kong ve la IP de Cloudflare y no la del cliente →
+          # este plugin bloquearía a todo el mundo o a nadie. Verificarlo con el
+          # paso 4 de k8s/scripts/smoke-test.sh antes de confiar en él.
+          # Detalle y alternativas en k8s/docs/kong-ingress.md.
+          - apiVersion: configuration.konghq.com/v1
+            kind: KongPlugin
+            metadata:
+              name: openbao-ip-restriction
+              namespace: openbao
+            plugin: ip-restriction
+            config:
+              status: 403
+              message: "Forbidden — vault.l-net.io restringido por IP"
+              allow:
+                - 10.88.0.0/14      # pods GKE lnet-privado
+                - 10.3.204.0/22     # nodos GKE lnet-privado
+                # - x.x.x.x/32      # ← IP pública de la oficina / VPN
+                # - x.x.x.x/32      # ← IP de salida de los consumidores
+
+          # Freno de mano: un cliente con un token válido pero en loop no debe
+          # poder saturar al líder de Raft. `policy: local` = por instancia de
+          # Kong (hay 2 réplicas → el límite efectivo es ~2x).
+          - apiVersion: configuration.konghq.com/v1
+            kind: KongPlugin
+            metadata:
+              name: openbao-rate-limiting
+              namespace: openbao
+            plugin: rate-limiting
+            config:
+              minute: 600
+              hour: 20000
+              policy: local
+              limit_by: ip
+              fault_tolerant: true
+              hide_client_headers: false
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    # La label la necesita el serviceMonitorNamespaceSelector de Prometheus.
+    managedNamespaceMetadata:
+      labels:
+        monitoring: enabled
+        app.kubernetes.io/part-of: platform
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 1m
+  revisionHistoryLimit: 5

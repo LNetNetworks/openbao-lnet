@@ -3,6 +3,11 @@
 > Dónde y cómo OpenBao guarda las llaves de firma Ethereum. Ruta: Docker hoy →
 > Kubernetes (GKE) en producción. Este doc cubre **dos ejes distintos**:
 > confidencialidad (cifrado) y **durabilidad/respaldo** (que no se pierdan).
+>
+> **Estado: la ruta recomendada acá (Raft + snapshots a GCS) ya está
+> implementada** en [`../k8s/`](../k8s/README.md) — 3 nodos Raft en GKE con
+> auto-unseal por Cloud KMS. Este doc conserva el análisis que llevó a esa
+> decisión. Ojo con el matiz de zona en la sección de RPO.
 
 ## TL;DR
 
@@ -299,6 +304,17 @@ POST /accounts → ethsign genera → escribe en storage → [CONFIRMA] → devu
 - **Raft 3+ nodos resuelve el escenario directo:** una escritura se confirma solo
   tras replicarse al **quórum** + fsync. Al recibir la address ya está en ≥2
   discos; si muere un nodo/zona 5 s después → **RPO cero**.
+
+> ⚠️ **Lo que se desplegó realmente (2026-08) no cumple la columna "zona".**
+> El cluster `lnet-privado` es **zonal** (`us-central1-c`), no regional: las 3
+> réplicas de OpenBao viven en la misma zona, cada una con un PD zonal. Eso da
+> **RPO≈0 para caída de un nodo o de un disco**, que es el fallo frecuente —
+> pero **no** para la caída de la zona entera, donde la recuperación es restore
+> del último snapshot (**RPO de hasta 6 h**, el intervalo del CronJob).
+> Para conseguir el RPO≈0 multi-zona que describe la tabla haría falta un
+> cluster GKE **regional**. Ver
+> [`../k8s/docs/operations.md`](../k8s/docs/operations.md) → "Cosas que este
+> despliegue NO cubre".
 
 ### El único punto donde Cloud SQL tiene ventaja (honesto)
 

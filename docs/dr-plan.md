@@ -1,10 +1,24 @@
 # Plan de DR — snapshots a GCS + auto-unseal con Cloud KMS
 
-> **Estado: PLAN, no implementado.** Este doc describe *qué* haríamos y *en qué
-> orden* para cubrir los dos ingredientes de recuperación descritos en
-> [`storage.md`](storage.md): (1) snapshots durables del estado y (2) custodia de
-> la root key. Los bloques de config son **bocetos ilustrativos**, no manifiestos
-> finales — faltan valores del entorno real (proyecto GCP, región, nombres).
+> **Estado: IMPLEMENTADO** (2026-08) en [`../k8s/`](../k8s/README.md).
+>
+> Este doc era el plan. Las dos partes que describe ya existen como código:
+>
+> | Parte del plan | Dónde está implementada |
+> |---|---|
+> | Auto-unseal con Cloud KMS | `seal "gcpckms"` en [`../k8s/argocd/openbao-application.yaml`](../k8s/argocd/openbao-application.yaml); KMS + Workload Identity en [`../k8s/gcp/setup-gcp.sh`](../k8s/gcp/setup-gcp.sh) |
+> | CronJob de snapshots a GCS | [`../k8s/backup/snapshot-cronjob.yaml`](../k8s/backup/snapshot-cronjob.yaml) |
+> | Custodia de las llaves | [`../k8s/docs/unseal-keys.md`](../k8s/docs/unseal-keys.md) |
+> | Restore | [`../k8s/docs/operations.md`](../k8s/docs/operations.md) |
+>
+> **Para desplegar u operar, ir a [`../k8s/docs/deployment.md`](../k8s/docs/deployment.md)**,
+> no a este archivo: los bloques de config de acá abajo siguen siendo los bocetos
+> originales (sin valores reales) y se conservan solo por el razonamiento.
+>
+> Dos decisiones cambiaron respecto al boceto: el CronJob **no** usa el
+> `snapshotAgent` del chart (exigiría claves HMAC de S3-interop, un secreto de
+> larga vida que Workload Identity evita), y se autentica por el **método
+> kubernetes auth** en vez de con un token estático.
 
 ## Objetivo
 
