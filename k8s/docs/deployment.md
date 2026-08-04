@@ -299,37 +299,46 @@ Crear en Cloudflare, zona `l-net.io`:
 
 | Tipo | Nombre | Contenido | Proxy |
 |------|--------|-----------|-------|
-| A | `vault` | `35.192.128.2` | **DNS only (nube gris)** |
+| A | `vault` | `35.192.128.2` | **Proxied (nube naranja)**, como el resto de la zona |
 
-> ⚠️ **`vault` es la excepción de la zona: va SIN proxy, a propósito.**
+Y, en la misma zona de Cloudflare, **el allowlist por IP**:
+
+- **IP Access Rules** con scope `vault.l-net.io`, o
+- una **WAF Custom Rule**:
+  `(http.host eq "vault.l-net.io" and not ip.src in {<IPs autorizadas>})` → Block
+
+> **Por qué el allowlist va en Cloudflare y no en Kong.** Kong **no puede ver la
+> IP del cliente** en este cluster: el Service `gateway-kong-proxy` tiene
+> `externalTrafficPolicy: Cluster`, así que kube-proxy hace SNAT antes de que el
+> paquete llegue a Kong. Medido: una petición desde `179.6.6.187` le llega a
+> Kong como `10.3.207.227` (IP de nodo). Cambiar el DNS a *DNS only* **no lo
+> arregla** — la IP se pierde en la capa L4 de Kubernetes, no en Cloudflare.
 >
-> Todo el resto de `l-net.io` está proxied — `stats`, `api-ppr`, `naas`, `auth`
-> y compañía resuelven a `104.21.35.194` / `172.67.178.218`, IPs del edge de
-> Cloudflare. Y el data plane de Kong **no** tiene `KONG_TRUSTED_IPS` ni
-> `KONG_REAL_IP_HEADER` configurados, así que ve la IP de Cloudflare como IP de
-> origen, nunca la del cliente.
+> En el edge de Cloudflare, en cambio, la IP del cliente es el peer TCP: el
+> filtro funciona por construcción, y de paso se suman el WAF y la mitigación
+> de DDoS.
 >
-> Con `vault` proxied, el `KongPlugin/openbao-ip-restriction` compararía CIDRs
-> de oficina contra IPs de Cloudflare y **bloquearía a todo el mundo** (o, si se
-> añadieran los rangos de Cloudflare al allowlist, dejaría pasar a todo internet
-> aparentando que hay control — que es peor).
->
-> Con **DNS only**, Kong ve la IP real y el allowlist funciona sin tocar nada
-> compartido. El coste: se pierden el WAF de Cloudflare y el ocultamiento de la
-> IP de origen — pero `35.192.128.2` ya es pública para las otras ~40 apps del
-> cluster, así que no se revela nada nuevo.
->
-> Las alternativas (configurar `real_ip` en Kong para todo el cluster, o mover
-> el allowlist al WAF de Cloudflare) están evaluadas en
-> [`kong-ingress.md`](kong-ingress.md) → "Punto de atención 1".
+> Por eso el `KongPlugin/openbao-ip-restriction` está deshabilitado en el
+> Application. El análisis completo, con las opciones para arreglarlo en Kong y
+> su coste, está en [`edge-client-ip.md`](edge-client-ip.md) — **léelo antes de
+> proponer cambios en el data plane de Kong**.
 
 **Verificación:**
 
 ```bash
 dig +short vault.l-net.io
-# 35.192.128.2                     → correcto (DNS only)
-# 104.21.x.x / 172.67.x.x          → está proxied: el allowlist NO funciona
+# 104.21.x.x / 172.67.x.x → proxied, correcto
+
+# Desde una IP NO autorizada (pedírselo a alguien de fuera):
+curl -s -o /dev/null -w '%{http_code}\n' https://vault.l-net.io/v1/sys/health
+# 403 (bloqueo de Cloudflare) → el allowlist funciona
 ```
+
+> ⚠️ **Hueco conocido:** quien conozca `35.192.128.2` puede saltarse Cloudflare
+> pegándole directo al LB con `Host: vault.l-net.io`. La IP es pública (la
+> comparten los ~40 dominios del cluster). Mientras no se resuelva, el control
+> real ante ese vector es el token de OpenBao. Formas de cerrarlo en
+> [`edge-client-ip.md`](edge-client-ip.md) §4.
 
 ---
 
@@ -453,6 +462,9 @@ Usar siempre `openbao-active` (apunta al líder), no `openbao`.
 - [`unseal-keys.md`](unseal-keys.md) — llaves: generación, custodia, rotación,
   y el camino Shamir como alternativa.
 - [`kong-ingress.md`](kong-ingress.md) — el Ingress en detalle y sus trampas.
+- [`edge-client-ip.md`](edge-client-ip.md) — por qué Kong no ve la IP del
+  cliente, por qué este despliegue necesita un allowlist, y las opciones para
+  arreglarlo en el edge.
 - [`operations.md`](operations.md) — runbook: failover, restore, upgrades, escalado.
 - [`../../docs/storage.md`](../../docs/storage.md) — por qué Raft y no PostgreSQL.
 - [`../../docs/throughput.md`](../../docs/throughput.md) — **HA ≠ throughput**, y el

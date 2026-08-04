@@ -43,13 +43,14 @@ annotations:
   konghq.com/protocols: https,http
   konghq.com/https-redirect-status-code: "301"
   konghq.com/strip-path: "false"
-  konghq.com/plugins: openbao-ip-restriction,openbao-rate-limiting
+  konghq.com/plugins: openbao-rate-limiting
 hosts:
   - host: vault.l-net.io
     paths: ["/"]
 ```
 
-Y dos `KongPlugin` en `extraObjects`.
+Y **un** `KongPlugin` en `extraObjects`: solo `rate-limiting`. El
+`ip-restriction` está deshabilitado a propósito — ver el punto de atención 1.
 
 ### Sin bloque `tls:` — a propósito
 
@@ -67,65 +68,79 @@ Con `path: /` y `strip-path: false`, la URL llega íntegra.
 
 ---
 
-## Punto de atención 1 — la IP real detrás de Cloudflare
+## Punto de atención 1 — Kong no ve la IP del cliente
 
-**Este es el riesgo principal de la parte de Kong, y está confirmado.**
+**El riesgo principal de la parte de Kong, confirmado por medición.**
 
-El `KongPlugin/openbao-ip-restriction` filtra por IP de origen. Pero:
+> Resumen acá; el análisis completo, con las opciones para arreglarlo y su
+> coste, está en **[`edge-client-ip.md`](edge-client-ip.md)**. Ese es el
+> documento que hay que leer antes de proponer cambios en el data plane.
+
+Una petición desde `179.6.6.187` le llega a Kong así:
+
+| Camino | `$remote_addr` que registra Kong |
+|---|---|
+| Directo al LB (`Host: ...` contra `35.192.128.2`) | `10.3.207.227` — **IP de nodo** |
+| Vía Cloudflare | `10.88.1.1` — **IP de pod** |
+
+La IP real no aparece en ninguno de los dos. La causa **no es Cloudflare**:
 
 ```bash
-$ dig +short stats.l-net.io api-ppr.l-net.io naas.l-net.io auth.l-net.io
-104.21.35.194
-172.67.178.218      # ← IPs del edge de Cloudflare, no 35.192.128.2
-...
+$ kubectl -n edge-system get svc gateway-kong-proxy \
+    -o jsonpath='{.spec.type} {.spec.externalTrafficPolicy}'
+LoadBalancer Cluster        # ← kube-proxy hace SNAT en L4
+```
 
+Con `externalTrafficPolicy: Cluster`, kube-proxy reescribe la IP de origen para
+poder balancear entre nodos. La IP del cliente se pierde **antes** de llegar a
+Kong. Cambiar el DNS a *DNS only* no lo arregla.
+
+Y el data plane tampoco recupera la IP desde headers:
+
+```bash
 $ kubectl -n edge-system get deploy gateway-kong \
     -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}{"\n"}{end}' \
     | grep -iE 'trusted|real_ip'
-                    # ← vacío: sin KONG_TRUSTED_IPS ni KONG_REAL_IP_HEADER
+                    # vacío: sin KONG_TRUSTED_IPS, KONG_REAL_IP_HEADER
+                    #        ni KONG_REAL_IP_RECURSIVE
 ```
 
-**Toda la zona `l-net.io` está proxied y Kong no recupera la IP real.** La
-conexión que le llega sale de una IP de Cloudflare, así que un allowlist con
-CIDRs de oficina:
+### Consecuencias, aplicadas en el Application
 
-- bloquea a todo el mundo (si no incluís los rangos de Cloudflare), o
-- deja pasar a todo internet (si los incluís) — que es peor, porque parece que
-  hay control cuando no lo hay.
+1. **No hay `KongPlugin/ip-restriction`.** Con CIDRs de oficina bloquearía a
+   todos; con las CIDRs internas (`10.3.204.0/22`, `10.88.0.0/14`) dejaría pasar
+   a todo internet, porque todo el tráfico externo llega con esas IPs. Un
+   control decorativo es peor que ninguno. Queda comentado en el manifiesto,
+   listo para descomentar cuando se arregle el edge.
+2. **El `rate-limiting` usa `limit_by: service`, no `ip`.** Por el mismo SNAT,
+   `limit_by: ip` sería un límite global disfrazado de límite por cliente — y un
+   solo cliente ruidoso dejaría fuera al resto.
+3. **El allowlist vive en Cloudflare** (IP Access Rules / WAF custom rule), donde
+   la IP del cliente sí es visible porque es el peer TCP. Por eso
+   `vault.l-net.io` va **proxied**, como el resto de la zona.
 
-### Decisión tomada: `vault` va DNS only
+### El hueco que queda
 
-`vault.l-net.io` es **la excepción de la zona**: registro A a `35.192.128.2`
-con la nube **gris**. Así Kong ve la IP real del cliente y el `ip-restriction`
-funciona sin tocar nada compartido.
-
-Lo que se pierde: el WAF de Cloudflare y el ocultamiento de la IP de origen.
-Aceptable, porque `35.192.128.2` ya es pública para las otras ~40 apps del
-cluster — no se revela nada que no estuviera expuesto.
-
-### Las alternativas que se descartaron
-
-| Opción | Por qué no |
-|---|---|
-| **Proxied + `real_ip` en Kong** | Es lo correcto a largo plazo (además arreglaría el logging de IPs de *todas* las apps): añadir `KONG_TRUSTED_IPS` con los rangos de Cloudflare y `KONG_REAL_IP_HEADER=X-Forwarded-For` en `cloud-infra/gitops-apps/argocd-applications/kong.yaml`. Se descartó **para este despliegue** porque toca las ~45 Ingress del cluster y exige coordinación con infra — no es un cambio que deba arrastrar la puesta en marcha de un vault. **Si algún día se hace, `vault` puede volver a proxied.** |
-| **Proxied + IP rules de Cloudflare** | Mover el allowlist al WAF de Cloudflare y dejar el `ip-restriction` solo con los CIDRs internos. Suma el WAF, pero saca el control de acceso de GitOps: deja de estar versionado y revisable en un MR |
+Quien conozca `35.192.128.2` puede saltarse Cloudflare pegándole directo al LB
+con `Host: vault.l-net.io`, y el allowlist de Cloudflare no se entera. La IP es
+pública. Mientras no se arregle el edge, el control real ante ese vector es el
+token de OpenBao más las políticas. Formas de cerrarlo, en
+[`edge-client-ip.md`](edge-client-ip.md) §4.
 
 ### Verificación
 
 ```bash
 dig +short vault.l-net.io
-# 35.192.128.2              → correcto
-# 104.21.x.x / 172.67.x.x   → está proxied, el allowlist NO filtra
+# 104.21.x.x / 172.67.x.x   → proxied, correcto
 
-# Y desde una IP que NO esté en el allowlist:
+# Desde una IP NO autorizada (pedírselo a alguien de fuera):
 curl -s -o /dev/null -w '%{http_code}\n' https://vault.l-net.io/v1/sys/health
-# 403 → el filtro funciona
-# 200 → Kong sigue sin ver la IP real
+# 403 → el allowlist de Cloudflare funciona
 ```
 
-El paso 4 de `k8s/scripts/smoke-test.sh` comprueba lo primero automáticamente y
-te recuerda hacer lo segundo (no se puede automatizar desde la misma máquina que
-está en el allowlist).
+El paso 4 de `k8s/scripts/smoke-test.sh` comprueba que el DNS esté proxied y que
+el `ip-restriction` siga deshabilitado, y te recuerda la prueba manual desde
+fuera (no se puede automatizar desde una máquina que ya está autorizada).
 
 ---
 
@@ -140,10 +155,9 @@ pedir por HTTP → **bucle de redirección**.
 
 Este par de anotaciones es exactamente el que ya usa `stats.l-net.io`
 (`gitops-apps/lnet-stats-dashboard/ingress.yaml`), que está proxied y **no**
-entra en bucle → la zona está en modo **Full**. Además, como `vault` va DNS only
-(punto anterior), Cloudflare ni siquiera está en el camino: el cliente habla
-directo con Kong. Con lo cual este punto no debería dar problemas. Igual,
-verificar:
+entra en bucle → la zona está en modo **Full**. `vault` usa la misma
+combinación y el mismo camino, así que este punto está resuelto por precedente.
+Igual, verificar:
 
 ```bash
 curl -sI http://vault.l-net.io/v1/sys/health | head -3

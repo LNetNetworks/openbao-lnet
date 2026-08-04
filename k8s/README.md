@@ -32,6 +32,7 @@ k8s/
     ├── deployment.md              ★ paso a paso
     ├── unseal-keys.md             recovery keys: custodia, rotación, desastres
     ├── kong-ingress.md            el Ingress y sus tres puntos de atención
+    ├── edge-client-ip.md          ⚠ por qué Kong no ve la IP del cliente y qué hacer
     └── operations.md              runbook: failover, restore, upgrades, escalado
 ```
 
@@ -98,10 +99,11 @@ Cada paso, con sus verificaciones y modos de fallo, en
 3. **El cluster es zonal** (`us-central1-c`). Esto tolera la caída de un *nodo*,
    no de la *zona*. Ante pérdida de zona la recuperación es restore de snapshot,
    con RPO de hasta 6h.
-4. **`vault.l-net.io` va DNS only en Cloudflare** (nube gris → `35.192.128.2`),
-   al revés que el resto de la zona. Kong no recupera la IP real detrás del
-   proxy de Cloudflare, así que proxied haría inútil el `ip-restriction`.
-   Ver [`docs/kong-ingress.md`](docs/kong-ingress.md) → "Punto de atención 1".
+4. **Kong no ve la IP del cliente** — el Service `gateway-kong-proxy` tiene
+   `externalTrafficPolicy: Cluster` y kube-proxy hace SNAT. Por eso **no hay
+   `KongPlugin/ip-restriction`** (bloquearía a todos) y el allowlist vive en
+   **Cloudflare**. Medición, consecuencias y opciones para arreglarlo en el
+   edge: [`docs/edge-client-ip.md`](docs/edge-client-ip.md).
 
 ---
 

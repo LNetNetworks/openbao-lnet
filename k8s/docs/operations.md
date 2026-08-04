@@ -301,11 +301,15 @@ Honestidad sobre los límites, para que nadie asuma de más:
   aplicación.
 - **Replicación entre regiones.** Es una feature Enterprise de Vault que OpenBao
   no tiene. La alternativa es snapshots + restore.
-- **WAF.** `vault.l-net.io` va DNS only para que el `ip-restriction` vea la IP
-  real, así que **no pasa por el WAF de Cloudflare** ni por su mitigación de
-  DDoS. La defensa de borde es el allowlist + rate limiting de Kong. Si algún
-  día se configura `real_ip` en el data plane de Kong (afecta a todo el
-  cluster), `vault` puede volver a proxied y recuperar el WAF.
+- **Control de acceso por IP en Kong.** Kong **no ve la IP del cliente** en este
+  cluster (SNAT de kube-proxy por `externalTrafficPolicy: Cluster`), así que no
+  hay `ip-restriction` y el allowlist vive en Cloudflare. Eso deja un hueco:
+  quien conozca `35.192.128.2` puede saltarse Cloudflare pegándole directo al
+  LB. El control real ante ese vector es el token + las políticas. Análisis y
+  opciones para arreglarlo: [`edge-client-ip.md`](edge-client-ip.md).
+- **Forense por IP.** Por lo mismo, los access logs de Kong no dicen de dónde
+  vino una petición — dicen "de un nodo". Afecta a las 50 Ingress del cluster,
+  no solo a ésta.
 
 ---
 
@@ -314,5 +318,6 @@ Honestidad sobre los límites, para que nadie asuma de más:
 - [`deployment.md`](deployment.md) — el despliegue desde cero.
 - [`unseal-keys.md`](unseal-keys.md) — recovery keys y escenarios de desastre.
 - [`kong-ingress.md`](kong-ingress.md) — el edge y sus trampas.
+- [`edge-client-ip.md`](edge-client-ip.md) — por qué Kong no ve la IP del cliente.
 - [`../../docs/throughput.md`](../../docs/throughput.md) — HA ≠ throughput, nonces.
 - [`../../docs/storage.md`](../../docs/storage.md) — por qué Raft.

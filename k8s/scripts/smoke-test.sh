@@ -97,11 +97,12 @@ echo "      ${HOST} → ${DNS_IPS:-<sin resolver>}"
 if [[ -z "${DNS_IPS}" ]]; then
   fail "DNS no resuelve — falta el registro en Cloudflare"
 elif [[ "${DNS_IPS}" == *"${KONG_LB}"* ]]; then
-  pass "DNS apunta directo al LB de Kong (${KONG_LB}) — DNS only, correcto"
+  # El allowlist vive en Cloudflare (Kong no ve la IP del cliente por el SNAT
+  # del Service; ver k8s/docs/edge-client-ip.md). Sin proxy, Cloudflare no está
+  # en el camino y no hay ningún filtro por IP.
+  fail "DNS apunta directo al LB (${KONG_LB}): el registro NO está proxied → el allowlist de Cloudflare no se aplica. Ver k8s/docs/edge-client-ip.md"
 else
-  # Toda la zona l-net.io está proxied y Kong no recupera la IP real, así que
-  # con vault proxied el ip-restriction compara CIDRs contra IPs de Cloudflare.
-  fail "DNS resuelve a ${DNS_IPS}(Cloudflare) en vez de ${KONG_LB} → el registro está PROXIED: el ip-restriction NO filtra. Ver k8s/docs/kong-ingress.md"
+  pass "DNS proxied por Cloudflare (${DNS_IPS}) — el allowlist del edge se aplica"
 fi
 
 HTTPS_CODE="$(curl -s -o /dev/null -w '%{http_code}' "${BAO_ADDR}/v1/sys/health" || echo 000)"
@@ -129,41 +130,43 @@ fi
 
 # ===========================================================================
 echo
-echo "[4/5] ip-restriction — ¿Kong ve tu IP o la de Cloudflare?"
+echo "[4/5] Control de acceso por IP"
 # ===========================================================================
-# Riesgo #1 de la parte de Kong: el data plane NO tiene KONG_TRUSTED_IPS ni
-# KONG_REAL_IP_HEADER, así que si el registro DNS estuviera proxied Kong vería
-# una IP de Cloudflare y el allowlist no filtraría nada. El paso [3/5] ya
-# comprueba que el DNS apunta directo al LB; acá se verifica el efecto real.
+# Kong NO ve la IP del cliente: el Service gateway-kong-proxy tiene
+# externalTrafficPolicy: Cluster y kube-proxy hace SNAT. Por eso el allowlist
+# vive en Cloudflare y NO hay un KongPlugin/ip-restriction.
+# Análisis completo: k8s/docs/edge-client-ip.md
 MY_IP="$(curl -s https://ifconfig.me 2>/dev/null || echo '?')"
 echo "      tu IP pública: ${MY_IP}"
-echo "      allowlist actual del KongPlugin:"
-kubectl -n "${NAMESPACE}" get kongplugin openbao-ip-restriction \
-  -o jsonpath='{.config.allow}' 2>/dev/null | sed 's/^/        /' || warn "no se pudo leer el KongPlugin"
-echo
 
-# ¿El plugin llegó realmente a la config de Kong? La columna PROGRAMMED de
-# `kubectl get kongplugin` sale vacía en este cluster, así que se consulta el
-# Admin API, que es la fuente de verdad.
-IN_KONG="$(kubectl -n edge-system run kong-probe-$$ --rm -i --restart=Never \
-  --image=curlimages/curl:8.10.1 --quiet -- \
-  curl -s http://gateway-kong-admin.edge-system.svc.cluster.local:8001/plugins 2>/dev/null \
-  | grep -c "k8s-name:openbao-ip-restriction" || true)"
-if [[ "${IN_KONG:-0}" -gt 0 ]]; then
-  pass "el ip-restriction está aplicado en Kong (visto en el Admin API)"
+# Regresión: si alguien vuelve a añadir el ip-restriction sin haber arreglado
+# el edge, bloquearía a todos los clientes. Mejor detectarlo acá.
+if kubectl -n "${NAMESPACE}" get kongplugin openbao-ip-restriction >/dev/null 2>&1; then
+  fail "existe un KongPlugin/openbao-ip-restriction: Kong no ve la IP real del cliente, así que ese plugin bloquea a TODOS. Ver k8s/docs/edge-client-ip.md"
 else
-  fail "el ip-restriction NO aparece en la config de Kong — revisá los logs del KIC"
+  pass "sin ip-restriction en Kong (correcto: el allowlist va en Cloudflare)"
+fi
+
+# El rate-limiting debe limitar por servicio, no por IP: con el SNAT todos los
+# clientes comparten la IP de nodo y `limit_by: ip` sería un límite global
+# disfrazado de límite por cliente.
+LIMIT_BY="$(kubectl -n "${NAMESPACE}" get kongplugin openbao-rate-limiting \
+  -o jsonpath='{.config.limit_by}' 2>/dev/null || echo '?')"
+if [[ "${LIMIT_BY}" == "service" ]]; then
+  pass "rate-limiting con limit_by=service"
+else
+  warn "rate-limiting con limit_by=${LIMIT_BY} (se espera 'service' — con SNAT, 'ip' es un límite global encubierto)"
 fi
 
 cat <<'EOF'
 
       VERIFICACIÓN MANUAL (no se puede automatizar desde acá):
-      pedí a alguien con una IP NO incluida en la allowlist que corra:
+      pedí a alguien con una IP NO autorizada en Cloudflare que corra:
 
           curl -s -o /dev/null -w '%{http_code}\n' https://vault.l-net.io/v1/sys/health
 
-      Debe devolver 403. Si devuelve 200, Kong no está viendo la IP real del
-      cliente → k8s/docs/kong-ingress.md, "Punto de atención 1".
+      Debe devolver 403 (bloqueo del edge de Cloudflare). Si devuelve 200,
+      falta la IP Access Rule / WAF rule → k8s/docs/deployment.md, paso 8.
 EOF
 
 # ===========================================================================
