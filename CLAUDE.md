@@ -109,6 +109,15 @@ If asked to "set up production" or "implement DR", start from these two docs —
 they hold the rationale and the intended shape (3/5-node StatefulSet, one PVC per
 pod, KMS auto-unseal, snapshot CronJob).
 
+## HA cluster (local, for learning only)
+
+`docker-compose.ha.yml` + `config/ha/openbao-{1,2,3}.hcl` bring up a 3-node Raft
+cluster to observe quorum/join/failover — **not real HA** (single host). The
+single-node POC (`docker-compose.yml`) is untouched. Bring-up order is delicate:
+init ONE node, unseal all three with the **same** key (joins are auto via
+`retry_join`), register the plugin once against the leader. Full procedure:
+[`docs/ha-cluster.md`](docs/ha-cluster.md).
+
 ## Docs
 
 `README.md` (English) and `docs/quickstart.md` (Spanish, based on a real POC run)

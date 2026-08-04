@@ -79,6 +79,41 @@ cluster_addr = "http://127.0.0.1:8201"   # requerido por Raft
 - En K8s: **StatefulSet de 3/5 nodos, un PVC por pod** (usar **PD regional** para
   tolerancia multi-zona).
 
+### ¿Cuántos nodos? Raft ≠ obligatoriamente 3
+
+Confusión habitual: "Raft necesita 3 instancias". **No.** Hay que separar dos cosas:
+
+- **Raft como backend de storage** → funciona con **1 nodo**. Es un backend válido
+  en solitario; simplemente no hay a quién replicar. **Es lo que usa esta POC en
+  Docker** (`node_id = "openbao-lnet-1"`, un solo servicio) — no hay que cambiar
+  nada.
+- **Raft como mecanismo de HA/quórum** → ahí es donde entran los 3/5 nodos.
+
+El número de nodos es una decisión de **disponibilidad**, no un requisito del
+backend.
+
+#### Por qué números impares (3, 5) para HA
+
+Raft necesita **mayoría (quórum)** para confirmar escrituras y elegir líder.
+Tolerancia = `(N-1)/2`:
+
+| Nodos | Quórum | Tolera caídas | Comentario |
+|-------|--------|---------------|------------|
+| 1 | 1 | 0 | POC / dev. Sin HA. Solo sobrevive a reinicio del proceso, no a pérdida de volumen. |
+| 2 | 2 | 0 | ❌ **Peor que 1**: si cae uno, se pierde quórum. No se usa. |
+| **3** | 2 | **1** | Mínimo real para HA. |
+| 5 | 3 | 2 | Mayor tolerancia (multi-zona). |
+
+Por eso siempre son impares: 2 no aporta tolerancia y 4 no aporta más que 3.
+
+> **Multi-nodo en un solo host Docker no da HA real:** aunque se puede levantar un
+> cluster de 3 con `retry_join` en Compose, si el host muere caen los 3. La HA de
+> verdad exige nodos en máquinas/zonas distintas → eso lo da Kubernetes
+> (StatefulSet + PD regional). En Docker local, **quédate con 1 nodo**.
+>
+> Para *probar/ver* el quórum y el failover en local hay un cluster de 3 nodos en
+> `docker-compose.ha.yml` — procedimiento en [`ha-cluster.md`](ha-cluster.md).
+
 ---
 
 ## Ruta B — Cloud SQL (PostgreSQL) como backend

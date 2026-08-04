@@ -1,0 +1,52 @@
+# 3-node Raft HA cluster (for LEARNING/testing quorum & failover).
+#
+# NOTE: 3 nodes on a single Docker host is NOT real HA — if the host dies, all
+# three die. Real HA needs nodes on separate machines/zones (Kubernetes). This
+# file is for observing raft join, list-peers and killing a node to see failover.
+#
+# Build the image first (shared by all nodes):
+#   docker compose build            # or: docker build -t openbao-lnet:latest .
+# Bring up the cluster:
+#   docker compose -f docker-compose.ha.yml up -d
+# See docs/storage.md ("¿Cuántos nodos?") for the quorum rationale.
+
+x-openbao-common: &openbao-common
+  image: openbao-lnet:latest
+  cap_add:
+    - IPC_LOCK
+  environment:
+    BAO_ADDR: "http://127.0.0.1:8200"
+  command: server -config=/openbao/config/openbao.hcl
+
+services:
+  openbao-1:
+    <<: *openbao-common
+    container_name: openbao-1
+    ports:
+      - "8200:8200"   # API of node 1 on the host
+    volumes:
+      - ./config/ha/openbao-1.hcl:/openbao/config/openbao.hcl:ro
+      - openbao-1-data:/openbao/file
+
+  openbao-2:
+    <<: *openbao-common
+    container_name: openbao-2
+    ports:
+      - "8210:8200"   # API of node 2 on the host
+    volumes:
+      - ./config/ha/openbao-2.hcl:/openbao/config/openbao.hcl:ro
+      - openbao-2-data:/openbao/file
+
+  openbao-3:
+    <<: *openbao-common
+    container_name: openbao-3
+    ports:
+      - "8220:8200"   # API of node 3 on the host
+    volumes:
+      - ./config/ha/openbao-3.hcl:/openbao/config/openbao.hcl:ro
+      - openbao-3-data:/openbao/file
+
+volumes:
+  openbao-1-data:
+  openbao-2-data:
+  openbao-3-data:
