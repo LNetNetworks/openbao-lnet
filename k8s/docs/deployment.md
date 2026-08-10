@@ -18,7 +18,8 @@ Internet
    │  vault.l-net.io → 35.192.128.2 (Cloudflare → LB de Kong)
    ▼
 Kong Gateway (ns edge-system)
-   │  Ingress class kong + KongPlugin ip-restriction + rate-limiting
+   │  Ingress class kong + KongPlugin rate-limiting
+   │  (el allowlist de IPs vive en Cloudflare, no en Kong — ver paso 8)
    ▼
 Service openbao-active (ns openbao)  ── selecciona SOLO al líder de Raft
    ▼
@@ -100,8 +101,23 @@ gcloud kms keys describe openbao-unseal-key \
 
 gcloud kms keys get-iam-policy openbao-unseal-key \
   --keyring=openbao-unseal --location=global --project=l-net-469615
-# debe listar openbao-kms@... con roles/cloudkms.cryptoKeyEncrypterDecrypter
+# debe listar openbao-kms@... con DOS roles:
+#   roles/cloudkms.cryptoKeyEncrypterDecrypter  (cifrar/descifrar la root key)
+#   roles/cloudkms.viewer                       (leer metadatos de la llave)
 ```
+
+⚠️ **Los dos roles son obligatorios.** `cryptoKeyEncrypterDecrypter` NO incluye
+`cloudkms.cryptoKeys.get`, y el seal `gcpckms` verifica que la llave exista
+*antes* de cifrar nada. Con solo el primer rol los pods arrancan y mueren en
+bucle (`CrashLoopBackOff`, 0/1) con:
+
+```
+Error configuring seal "gcpckms": error checking key existence:
+rpc error: code = PermissionDenied desc = Permission 'cloudkms.cryptoKeys.get' denied
+```
+
+El binding de `viewer` va **sobre el recurso de la llave**, no sobre el keyring
+ni el proyecto: da lectura de metadatos de esa llave y nada más.
 
 ---
 
@@ -140,8 +156,14 @@ echo "TAG = $TAG"
 
 1. Editar `k8s/argocd/openbao-application.yaml`:
    - `server.image.tag`: poner el `$TAG` del paso 2 (reemplaza `REPLACE_ME`).
-   - `extraObjects` → `openbao-ip-restriction` → `config.allow`: **poner los
-     CIDRs reales**. Los comentados de ejemplo no sirven.
+     Es el **único** valor que hay que tocar.
+
+   > No busques un `KongPlugin/openbao-ip-restriction` que rellenar: **no
+   > existe a propósito**. Kong no ve la IP del cliente en este cluster (SNAT
+   > de kube-proxy), así que un allowlist de CIDRs bloquearía a todo el mundo.
+   > En el Application queda un bloque comentado explicando por qué; el
+   > allowlist real se configura en Cloudflare en el paso 8. Detalle completo
+   > en [`edge-client-ip.md`](edge-client-ip.md).
 
 2. Copiarlo a cloud-infra y registrarlo:
 
@@ -174,13 +196,24 @@ Lo esperado:
 ```
 NAME         READY   STATUS    RESTARTS   AGE
 openbao-0    0/1     Running   0          40s
-openbao-1    0/1     Running   0          30s
-openbao-2    0/1     Running   0          20s
 ```
 
-**`0/1 Ready` es correcto en este punto.** El readiness probe corre
-`bao status`, que sale con código 2 mientras el cluster no está inicializado.
-Es el mismo comportamiento que en el POC (ver el gotcha del `CLAUDE.md`).
+**Un solo pod, y `0/1 Ready`. Las dos cosas son correctas en este punto.**
+
+- **`0/1`**: el readiness probe corre `bao status`, que sale con código 2
+  mientras el cluster no está inicializado. Mismo comportamiento que en el POC
+  (ver el gotcha del `CLAUDE.md`).
+- **Un solo pod**: el StatefulSet usa `podManagementPolicy: OrderedReady`, así
+  que Kubernetes **no crea `openbao-1` hasta que `openbao-0` esté Ready** — y
+  eso no pasa hasta el `operator init` del Paso 5. No es un fallo de scheduling
+  ni de anti-affinity; `kubectl -n openbao get sts openbao` va a mostrar
+  `READY 0/3`.
+
+La secuencia se destraba sola con el init: `openbao-0` queda Ready → nace
+`openbao-1`, hace `retry_join` contra el líder y se desella con KMS → Ready →
+nace `openbao-2`. Por eso `init-openbao.sh` espera a los 3 pods **después** de
+inicializar, no antes. Los 3 `Running` juntos recién se ven al terminar el
+Paso 5.
 
 Si algún pod queda **Pending**: el `podAntiAffinity` exige un nodo distinto por
 pod y el node pool autoescala de 2 a 5. Esperá a que suba el tercer nodo:

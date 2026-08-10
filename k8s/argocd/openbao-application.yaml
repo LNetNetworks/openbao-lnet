@@ -69,7 +69,7 @@ spec:
             registry: us-central1-docker.pkg.dev
             repository: l-net-469615/l-net-docker-repo/openbao-ethsign
             # ↓↓↓ ESTE es el campo que bumpea el job manual del pipeline ↓↓↓
-            tag: "REPLACE_ME"
+            tag: "3fd9333"
             pullPolicy: IfNotPresent
 
           logLevel: info
@@ -133,7 +133,9 @@ spec:
           # Probes
           # -------------------------------------------------------------------
           # readiness: exec `bao status` (exit 0 = unsealed, 2 = sealed).
-          # Antes del `operator init` los 3 pods quedan 0/1 Ready — es lo esperado.
+          # Antes del `operator init` openbao-0 queda 0/1 Ready — es lo esperado.
+          # Con podManagementPolicy OrderedReady, openbao-1 y -2 ni siquiera se
+          # crean hasta que openbao-0 pase a Ready (o sea, hasta el init).
           readinessProbe:
             enabled: true
             failureThreshold: 2
@@ -142,10 +144,22 @@ spec:
             successThreshold: 1
             timeoutSeconds: 3
 
-          # liveness con standbyok: un standby sano NO debe reiniciarse.
+          # liveness: solo debe matar al proceso si está COLGADO, nunca por
+          # estar en standby, sellado o sin inicializar — reiniciar no arregla
+          # ninguno de esos tres y provoca un CrashLoop eterno.
+          #   standbyok=true    → un standby sano responde 200, no 429
+          #   uninitcode=204    → sin `operator init` responde 204, no 501
+          #                       (si no, el kubelet mata el pod a los ~170s y
+          #                        nunca llegás a inicializarlo)
+          #   sealedcode=204    → sellado responde 204, no 503; con auto-unseal
+          #                       por KMS el pod se desella solo, reiniciarlo
+          #                       solo alarga el outage si KMS tarda
+          # El readiness (exec `bao status`) sigue marcando 0/1 en esos estados,
+          # así que un pod sellado NO recibe tráfico. Ese es su trabajo, no el
+          # del liveness.
           livenessProbe:
             enabled: true
-            path: /v1/sys/health?standbyok=true
+            path: "/v1/sys/health?standbyok=true&uninitcode=204&sealedcode=204"
             port: 8200
             failureThreshold: 5
             initialDelaySeconds: 120

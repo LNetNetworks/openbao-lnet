@@ -40,8 +40,9 @@ KMS — el punto donde de verdad se pierden las llaves. Es el cambio de mayor im
 en DR, por eso va primero.
 
 ### Prerrequisitos
-- [ ] Proyecto GCP y **keyring + key de Cloud KMS** creados (rol
-      `cloudkms.cryptoKeyEncrypterDecrypter` para la identidad de OpenBao).
+- [ ] Proyecto GCP y **keyring + key de Cloud KMS** creados (roles
+      `cloudkms.cryptoKeyEncrypterDecrypter` **y** `cloudkms.viewer` sobre la
+      key, para la identidad de OpenBao — los dos hacen falta).
 - [ ] **Workload Identity** en GKE: mapear la ServiceAccount de K8s del pod de
       OpenBao a una GCP SA con ese rol (evita claves JSON montadas).
 - [ ] Decidir región/keyring acorde a la región del cluster.

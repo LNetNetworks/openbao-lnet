@@ -249,7 +249,15 @@ cluster. Está fuera de alcance acá — documentarlo cuando se necesite.
 La última fila es la razón por la que
 [`k8s/gcp/terraform.tf.example`](../gcp/terraform.tf.example) pone
 `prevent_destroy = true` en la crypto key y en el key ring, y por la que el
-GSA solo tiene `cryptoKeyEncrypterDecrypter` y nunca `cloudkms.admin`.
+GSA se limita a dos roles **sobre el recurso de la key**, nunca `cloudkms.admin`:
+
+| Rol | Para qué | ¿Se puede omitir? |
+|---|---|---|
+| `roles/cloudkms.cryptoKeyEncrypterDecrypter` | Cifrar/descifrar la root key en cada arranque | No |
+| `roles/cloudkms.viewer` | El check de existencia de la key que hace el seal al arrancar (`cloudkms.cryptoKeys.get`) | No — sin él los pods entran en `CrashLoopBackOff` |
+
+Ninguno de los dos permite destruir la key, rotarla ni leer material
+criptográfico: `viewer` solo expone metadatos de esa key.
 
 ---
 

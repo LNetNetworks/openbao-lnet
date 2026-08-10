@@ -106,7 +106,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. IAM sobre la KMS key — SOLO encrypt/decrypt, nunca admin
+# 3. IAM sobre la KMS key — SOLO encrypt/decrypt + lectura, nunca admin
 # ---------------------------------------------------------------------------
 echo "==> Permiso encrypt/decrypt sobre ${KMS_KEY}"
 run gcloud kms keys add-iam-policy-binding "${KMS_KEY}" \
@@ -114,6 +114,20 @@ run gcloud kms keys add-iam-policy-binding "${KMS_KEY}" \
   --location="${KMS_LOCATION}" \
   --member="serviceAccount:${GSA_EMAIL}" \
   --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" \
+  --project="${PROJECT_ID}" \
+  --condition=None
+
+# El seal gcpckms hace un check de existencia de la llave al arrancar, que
+# necesita cloudkms.cryptoKeys.get — permiso que cryptoKeyEncrypterDecrypter
+# NO incluye. Sin esto los pods entran en CrashLoopBackOff con
+# "Error configuring seal gcpckms: error checking key existence: PermissionDenied".
+# viewer va acotado al recurso de la llave: solo metadatos, nada de admin.
+echo "==> Permiso de lectura (cryptoKeys.get) sobre ${KMS_KEY}"
+run gcloud kms keys add-iam-policy-binding "${KMS_KEY}" \
+  --keyring="${KMS_KEYRING}" \
+  --location="${KMS_LOCATION}" \
+  --member="serviceAccount:${GSA_EMAIL}" \
+  --role="roles/cloudkms.viewer" \
   --project="${PROJECT_ID}" \
   --condition=None
 

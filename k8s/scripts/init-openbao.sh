@@ -98,8 +98,12 @@ echo "    Ningún 'bao operator unseal' manual: de eso se encarga Cloud KMS."
 kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod \
   -l app.kubernetes.io/name=openbao --timeout=300s || {
     red "Timeout. Revisá los logs:  kubectl -n ${NAMESPACE} logs ${POD}"
-    red "Causa típica: el GSA no tiene cryptoKeyEncrypterDecrypter, o la"
-    red "annotation de Workload Identity no coincide. Ver k8s/gcp/setup-gcp.sh."
+    red "Causas típicas (todas en k8s/gcp/setup-gcp.sh):"
+    red "  - 'error checking key existence: PermissionDenied' → al GSA le falta"
+    red "    roles/cloudkms.viewer sobre la key. cryptoKeyEncrypterDecrypter NO"
+    red "    incluye cloudkms.cryptoKeys.get; hacen falta LOS DOS roles."
+    red "  - El GSA no tiene cryptoKeyEncrypterDecrypter."
+    red "  - La annotation de Workload Identity no coincide con el GSA."
     exit 1
   }
 

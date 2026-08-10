@@ -95,7 +95,10 @@ Cada paso, con sus verificaciones y modos de fallo, en
    llaves privadas anteriores.
 2. **Destruir la KMS key `openbao-unseal-key` cierra el vault para siempre**, ni
    las recovery keys ayudan. Por eso lleva `prevent_destroy` en el Terraform y
-   el GSA solo tiene `cryptoKeyEncrypterDecrypter`.
+   el GSA se queda en `cryptoKeyEncrypterDecrypter` + `viewer` sobre esa key
+   —cifrar/descifrar y leer metadatos—, nunca `cloudkms.admin`. Los dos roles
+   son obligatorios: sin `viewer` los pods no arrancan (ver
+   [`docs/deployment.md`](docs/deployment.md#paso-1--recursos-de-gcp)).
 3. **El cluster es zonal** (`us-central1-c`). Esto tolera la caída de un *nodo*,
    no de la *zona*. Ante pérdida de zona la recuperación es restore de snapshot,
    con RPO de hasta 6h.
