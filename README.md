@@ -9,15 +9,23 @@ broadcast.
 The signing engine is [`kaleido-io/vault-plugin-secrets-ethsign`](https://github.com/kaleido-io/vault-plugin-secrets-ethsign)
 (secp256k1 / EIP-155), built from source and baked into the image.
 
+> **Going to production?** This README covers the local Docker setup. The
+> Kubernetes deployment — 3-node Raft cluster on GKE with Cloud KMS auto-unseal,
+> published at `https://vault.l-net.io` through Kong — lives in
+> **[`k8s/`](k8s/README.md)**. Start at
+> [`k8s/docs/deployment.md`](k8s/docs/deployment.md).
+
 ## What's in this repo
 
 | Path | Purpose |
 |------|---------|
 | `Dockerfile` | Multi-stage build: compiles the `ethsign` plugin, then bakes it into the official `openbao/openbao` image. |
-| `config/openbao.hcl` | OpenBao server config (TCP listener, file storage, `plugin_directory`). |
+| `config/openbao.hcl` | OpenBao server config (TCP listener, Raft integrated storage, `plugin_directory`). |
 | `docker-compose.yml` | Brings up the server with the plugin available. |
 | `scripts/register-plugin.sh` | Registers + enables the `ethsign` engine in a running, unsealed server. |
 | `scripts/demo-sign.sh` | End-to-end demo: create an account and sign a transaction. |
+| `docker-compose.ha.yml` + `config/ha/` | 3-node Raft cluster on one host, to observe quorum/failover. Not real HA — see [`docs/ha-cluster.md`](docs/ha-cluster.md). |
+| `k8s/` | **Production deployment on Kubernetes** (Helm + ArgoCD, GKE, Cloud KMS auto-unseal, Kong ingress, GCS snapshots). |
 
 > The plugin is compiled with `CGO_ENABLED=0`, so go-ethereum uses its pure-Go
 > secp256k1 implementation and the resulting binary is fully static — it runs
@@ -150,13 +158,25 @@ docker compose down -v     # stop and DELETE the data volume (keys are gone!)
 
 ## Production notes
 
+> All of the points below are **already solved** in the Kubernetes deployment
+> under [`k8s/`](k8s/README.md). They remain here as the checklist for anyone
+> running this image somewhere else.
+
 - **Unseal shares:** use a realistic `-key-shares` / `-key-threshold` (e.g. 5/3),
-  or configure auto-unseal.
+  or configure auto-unseal. In Kubernetes, manual unseal is not viable — pods
+  restart on their own; see [`k8s/docs/unseal-keys.md`](k8s/docs/unseal-keys.md).
 - **TLS:** this config uses `tls_disable = true` for local convenience. Enable
   TLS on the listener for any real deployment.
 - **mlock:** `disable_mlock = true` is set for containers; the compose file also
   grants `IPC_LOCK`. Review per your threat model.
-- **Backups:** the file storage backend lives in the `openbao-data` volume —
-  back it up, and protect your unseal keys/root token.
+- **Storage:** this POC uses **Integrated Storage (Raft)** — OpenBao's
+  recommended production backend, with native HA and no external database. In
+  Kubernetes, run a 3/5-node StatefulSet (one PVC per pod). See
+  [`docs/storage.md`](docs/storage.md) for the Raft-vs-PostgreSQL rationale.
+- **Backups:** the Raft data lives in the `openbao-data` volume — back it up,
+  and protect your unseal keys/root token. (Kubernetes: `raft snapshot save` to
+  GCS every 6h, [`k8s/backup/snapshot-cronjob.yaml`](k8s/backup/snapshot-cronjob.yaml).)
 - **Least privilege:** create scoped policies + tokens for signing clients
-  instead of handing out the root token.
+  instead of handing out the root token. (Kubernetes: Kubernetes auth method +
+  an `ethsign-signer` policy that explicitly denies private-key export —
+  [`k8s/scripts/bootstrap-auth.sh`](k8s/scripts/bootstrap-auth.sh).)

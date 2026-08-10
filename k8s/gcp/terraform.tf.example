@@ -1,0 +1,159 @@
+# =============================================================================
+# Equivalente Terraform de k8s/gcp/setup-gcp.sh
+# =============================================================================
+#
+# NO es parte de este repo POC: es el bloque a copiar dentro de
+#   cloud-infra/infrastructure/live/projects/l-net/dev/openbao.tf
+# cuando se quiera que estos recursos estén bajo IaC en vez de creados por
+# script.
+#
+# El script `setup-gcp.sh` y este archivo hacen lo mismo. Si se adopta
+# Terraform, importar primero lo ya creado:
+#
+#   terraform import google_kms_key_ring.openbao_unseal \
+#     projects/l-net-469615/locations/global/keyRings/openbao-unseal
+#   terraform import google_kms_crypto_key.openbao_unseal \
+#     projects/l-net-469615/locations/global/keyRings/openbao-unseal/cryptoKeys/openbao-unseal-key
+#   terraform import google_service_account.openbao_kms \
+#     projects/l-net-469615/serviceAccounts/openbao-kms@l-net-469615.iam.gserviceaccount.com
+#   terraform import google_storage_bucket.openbao_snapshots l-net-469615/lnet-openbao-snapshots
+#
+# OJO con el estado de ese directorio: `lnet-privado.tf` documenta que el
+# cluster productivo NO está reconciliado en el state (ver MIGRATION-NOTES.md).
+# Estos recursos son independientes del cluster, así que se pueden gestionar
+# sin tocar esa deuda — pero verificar el `terraform plan` antes de aplicar.
+# =============================================================================
+
+locals {
+  openbao_namespace = "openbao"
+}
+
+# -----------------------------------------------------------------------------
+# Cloud KMS — protege la root key de OpenBao (auto-unseal)
+# -----------------------------------------------------------------------------
+resource "google_kms_key_ring" "openbao_unseal" {
+  name     = "openbao-unseal"
+  location = "global"
+  project  = var.project_id
+
+  # Un key ring no se puede borrar en GCP.
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_kms_crypto_key" "openbao_unseal" {
+  name     = "openbao-unseal-key"
+  key_ring = google_kms_key_ring.openbao_unseal.id
+  purpose  = "ENCRYPT_DECRYPT"
+
+  # Rotación trimestral. Las versiones anteriores se conservan, así que el
+  # material cifrado con ellas se sigue descifrando.
+  rotation_period = "7776000s" # 90 días
+
+  # DESTRUIR ESTA KEY = PERDER TODAS LAS LLAVES PRIVADAS DEL VAULT.
+  # Ni las recovery keys sirven sin ella.
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Identidad de los pods
+# -----------------------------------------------------------------------------
+resource "google_service_account" "openbao_kms" {
+  account_id   = "openbao-kms"
+  display_name = "OpenBao auto-unseal + snapshots"
+  description  = "Usada por los pods de OpenBao (ns openbao) vía Workload Identity"
+  project      = var.project_id
+}
+
+# Solo encrypt/decrypt sobre la key concreta — nunca roles/cloudkms.admin.
+resource "google_kms_crypto_key_iam_member" "openbao_unseal" {
+  crypto_key_id = google_kms_crypto_key.openbao_unseal.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${google_service_account.openbao_kms.email}"
+}
+
+# OBLIGATORIO además del anterior. El seal gcpckms verifica que la key exista
+# al arrancar, y eso necesita cloudkms.cryptoKeys.get, permiso que
+# cryptoKeyEncrypterDecrypter NO incluye. Sin este binding los pods quedan en
+# CrashLoopBackOff con "error checking key existence: PermissionDenied".
+# Va sobre el recurso de la key (no el key ring ni el proyecto): solo metadatos.
+resource "google_kms_crypto_key_iam_member" "openbao_unseal_viewer" {
+  crypto_key_id = google_kms_crypto_key.openbao_unseal.id
+  role          = "roles/cloudkms.viewer"
+  member        = "serviceAccount:${google_service_account.openbao_kms.email}"
+}
+
+# -----------------------------------------------------------------------------
+# Bucket de snapshots de Raft
+# -----------------------------------------------------------------------------
+resource "google_storage_bucket" "openbao_snapshots" {
+  name                        = "lnet-openbao-snapshots"
+  location                    = "US-CENTRAL1"
+  project                     = var.project_id
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = false
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition {
+      age            = 30
+      with_state     = "LIVE"
+    }
+  }
+
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition {
+      days_since_noncurrent_time = 7
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_storage_bucket_iam_member" "openbao_snapshots" {
+  bucket = google_storage_bucket.openbao_snapshots.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.openbao_kms.email}"
+}
+
+# -----------------------------------------------------------------------------
+# Workload Identity — dos KSA del namespace openbao usan el mismo GSA
+#   openbao/openbao           → servidores (descifran la root key con KMS)
+#   openbao/openbao-snapshot  → CronJob de snapshots (escribe en GCS)
+# -----------------------------------------------------------------------------
+resource "google_service_account_iam_member" "openbao_wi" {
+  for_each = toset(["openbao", "openbao-snapshot"])
+
+  service_account_id = google_service_account.openbao_kms.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[${local.openbao_namespace}/${each.value}]"
+}
+
+# -----------------------------------------------------------------------------
+# Outputs — deben coincidir con k8s/argocd/openbao-application.yaml
+# -----------------------------------------------------------------------------
+output "openbao_gsa_email" {
+  value       = google_service_account.openbao_kms.email
+  description = "Va en serviceAccount.annotations['iam.gke.io/gcp-service-account']"
+}
+
+output "openbao_kms_config" {
+  value = {
+    project    = var.project_id
+    region     = google_kms_key_ring.openbao_unseal.location
+    key_ring   = google_kms_key_ring.openbao_unseal.name
+    crypto_key = google_kms_crypto_key.openbao_unseal.name
+  }
+  description = "Valores del bloque seal \"gcpckms\" del HCL"
+}

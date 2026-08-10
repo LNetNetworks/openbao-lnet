@@ -2,6 +2,7 @@ services:
   openbao:
     build:
       context: .
+      # Build args (OPENBAO_VERSION, ETHSIGN_REF) documented in docs/CONFIGURE.md
       args:
         OPENBAO_VERSION: ${OPENBAO_VERSION:-latest}
         ETHSIGN_REF: ${ETHSIGN_REF:-efdc481c29f9eb9a04c8c47e0636bdddc98b9163}
@@ -9,6 +10,7 @@ services:
     container_name: openbao-lnet
     ports:
       - "8200:8200"
+      - "8201:8201"   # Raft cluster port (required by integrated storage)
     cap_add:
       - IPC_LOCK
     environment:
