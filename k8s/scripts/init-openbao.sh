@@ -39,12 +39,20 @@ echo "==> Contexto de kubectl: $(kubectl config current-context)"
 echo "==> Pods en ${NAMESPACE}:"
 kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=openbao
 
-RUNNING="$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=openbao \
-  --field-selector=status.phase=Running -o name | wc -l | tr -d ' ')"
-if [[ "${RUNNING}" -lt "${EXPECTED_REPLICAS}" ]]; then
-  red "Solo ${RUNNING}/${EXPECTED_REPLICAS} pods en Running."
-  echo "Los pods deben estar Running (aunque 0/1 Ready — es normal antes del init)."
-  echo "Si alguno está Pending, revisá que el node pool tenga 3 nodos (podAntiAffinity)."
+# Antes del init solo puede existir UN pod: el StatefulSet usa
+# podManagementPolicy OrderedReady, así que openbao-1 no se crea hasta que
+# openbao-0 esté Ready, y eso no pasa hasta que este script lo inicialice.
+# Exigir 3 pods acá sería una precondición imposible de cumplir. Los otros dos
+# se verifican DESPUÉS del init, en el paso 4.
+POD_PHASE="$(kubectl -n "${NAMESPACE}" get pod "${POD}" \
+  -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+if [[ "${POD_PHASE}" != "Running" ]]; then
+  red "${POD} está en '${POD_PHASE:-inexistente}', se necesita Running."
+  echo "0/1 Ready es normal antes del init; Running es lo que hace falta."
+  echo "  - Pending      → el podAntiAffinity pide un nodo por pod; revisá que"
+  echo "                   el node pool haya escalado (kubectl get nodes)."
+  echo "  - Terminating  → esperá a que se recree y volvé a correr esto."
+  echo "  - CrashLoop    → kubectl -n ${NAMESPACE} logs ${POD} --previous"
   exit 1
 fi
 
@@ -93,19 +101,41 @@ echo "    OK — guardado."
 # ---------------------------------------------------------------------------
 # 4. Esperar el auto-unseal del resto de los nodos
 # ---------------------------------------------------------------------------
-bold "==> Esperando a que los 3 nodos queden Ready (auto-unseal + retry_join)"
+bold "==> Esperando a que los ${EXPECTED_REPLICAS} nodos queden Ready (auto-unseal + retry_join)"
 echo "    Ningún 'bao operator unseal' manual: de eso se encarga Cloud KMS."
-kubectl -n "${NAMESPACE}" wait --for=condition=Ready pod \
-  -l app.kubernetes.io/name=openbao --timeout=300s || {
-    red "Timeout. Revisá los logs:  kubectl -n ${NAMESPACE} logs ${POD}"
-    red "Causas típicas (todas en k8s/gcp/setup-gcp.sh):"
-    red "  - 'error checking key existence: PermissionDenied' → al GSA le falta"
-    red "    roles/cloudkms.viewer sobre la key. cryptoKeyEncrypterDecrypter NO"
-    red "    incluye cloudkms.cryptoKeys.get; hacen falta LOS DOS roles."
-    red "  - El GSA no tiene cryptoKeyEncrypterDecrypter."
-    red "  - La annotation de Workload Identity no coincide con el GSA."
-    exit 1
-  }
+echo "    Con OrderedReady los pods nacen de a uno: openbao-0 Ready → se crea"
+echo "    openbao-1 → retry_join + auto-unseal → Ready → se crea openbao-2."
+
+# OJO: `kubectl wait -l app...` NO sirve acá. Solo espera a los pods que existen
+# en el momento de invocarlo, y en este punto existe únicamente openbao-0 — daría
+# éxito con 1/3 nodos arriba. Hay que esperar sobre readyReplicas del StatefulSet.
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-420}"
+DEADLINE=$((SECONDS + WAIT_TIMEOUT))
+READY=0
+while (( SECONDS < DEADLINE )); do
+  READY="$(kubectl -n "${NAMESPACE}" get sts openbao \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+  READY="${READY:-0}"
+  printf '\r    Ready: %s/%s  (%ss)' "${READY}" "${EXPECTED_REPLICAS}" "${SECONDS}"
+  [[ "${READY}" -ge "${EXPECTED_REPLICAS}" ]] && break
+  sleep 5
+done
+echo
+if [[ "${READY}" -lt "${EXPECTED_REPLICAS}" ]]; then
+  red "Timeout: ${READY}/${EXPECTED_REPLICAS} nodos Ready tras ${WAIT_TIMEOUT}s."
+  red "El init YA se hizo y el material está guardado — NO vuelvas a correr"
+  red "este script. Esto es un problema de arranque de los nodos restantes."
+  red "Revisá los logs:  kubectl -n ${NAMESPACE} logs ${POD}"
+  red "Causas típicas (todas en k8s/gcp/setup-gcp.sh):"
+  red "  - 'error checking key existence: PermissionDenied' → al GSA le falta"
+  red "    roles/cloudkms.viewer sobre la key. cryptoKeyEncrypterDecrypter NO"
+  red "    incluye cloudkms.cryptoKeys.get; hacen falta LOS DOS roles."
+  red "  - El GSA no tiene cryptoKeyEncrypterDecrypter."
+  red "  - La annotation de Workload Identity no coincide con el GSA."
+  red "  - Un cambio de plantilla del STS pendiente: el rollout se atasca si un"
+  red "    pod no llega a Ready. kubectl -n ${NAMESPACE} delete pod ${POD}"
+  exit 1
+fi
 
 echo "==> Peers de Raft:"
 kexec bao operator raft list-peers 2>/dev/null || \

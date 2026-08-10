@@ -6,3 +6,10 @@ unseal-keys*.txt
 root-token*.txt
 vault-init.txt
 .env
+
+# Salida de `bao operator init` en K8s: recovery keys + root token EN CLARO.
+# init-openbao.sh ya las guarda en GCP Secret Manager (openbao-prod-recovery);
+# la copia local es redundante y hay que borrarla en cuanto se verifique.
+seal.json
+seal*.json
+k8s/secrets-seal/

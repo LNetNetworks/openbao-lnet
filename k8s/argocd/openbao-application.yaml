@@ -270,6 +270,34 @@ spec:
                   crypto_key = "openbao-unseal-key"
                 }
 
+                # AUDIT DEVICE — declarativo, NO por API.
+                #
+                # Sin auditoría no hay rastro de quién pidió qué firma; es el
+                # requisito no negociable de un sistema que custodia llaves.
+                #
+                # Desde OpenBao 2.3.2 `bao audit enable` falla con
+                #   "cannot enable audit device via API; use declarative,
+                #    config-based audit device management instead"
+                # salvo que se ponga `unsafe_allow_api_audit_creation = true`.
+                # Está cerrado a propósito: un audit device de tipo file escribe
+                # en rutas ARBITRARIAS (y el de socket, a sockets arbitrarios),
+                # así que un token admin filtrado permitiría exfiltrar secretos.
+                # No habilitamos ese flag: se declara acá y punto.
+                #
+                # El segundo label es el nombre del mount → aparece como "file/"
+                # en `bao audit list`. El PVC `audit` (10Gi) ya está montado en
+                # /openbao/audit por el chart (auditStorage.enabled).
+                #
+                # OJO: si el audit device no puede escribir, OpenBao DEJA DE
+                # RESPONDER (a propósito: prefiere caerse antes que operar sin
+                # auditoría). Vigilar el disco — alerta en k8s/docs/operations.md.
+                audit "file" "file" {
+                  description = "Audit log en el PVC audit-openbao-N"
+                  options = {
+                    file_path = "/openbao/audit/audit.log"
+                  }
+                }
+
                 # Mantiene la label openbao-active=true en el pod líder, que es lo
                 # que selecciona el Service `openbao-active` del Ingress.
                 service_registration "kubernetes" {}

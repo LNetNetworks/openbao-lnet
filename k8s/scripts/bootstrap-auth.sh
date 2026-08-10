@@ -49,9 +49,22 @@ kexec_stdin() {
 # ---------------------------------------------------------------------------
 echo "==> Audit device en /openbao/audit/audit.log"
 if kexec bao audit list -format=json 2>/dev/null | grep -q '"file/"'; then
-  echo "    ya habilitado — skip"
+  echo "    activo (declarativo) — OK"
 else
-  kexec bao audit enable file file_path=/openbao/audit/audit.log
+  red "NO hay audit device activo. Abortando ANTES de configurar auth."
+  echo
+  echo "Ya no se habilita por API: desde OpenBao 2.3.2 'bao audit enable' falla"
+  echo "con 'cannot enable audit device via API'. El device se declara en el HCL"
+  echo "del Application (bloque audit \"file\" \"file\"), y este script solo verifica."
+  echo
+  echo "Comprobá, en este orden:"
+  echo "  1. Que el bloque esté en la config viva:"
+  echo "       kubectl -n ${NAMESPACE} get cm openbao-config -o yaml | grep -A6 audit"
+  echo "  2. Que los pods hayan tomado la config nueva (rollout completo):"
+  echo "       kubectl -n ${NAMESPACE} rollout status sts/openbao"
+  echo "  3. Que el PVC de audit esté montado y con espacio:"
+  echo "       kubectl -n ${NAMESPACE} exec ${POD} -- df -h /openbao/audit"
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
