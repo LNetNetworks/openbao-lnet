@@ -1,0 +1,20 @@
+Registra la ruta nueva en paths(). Aplicar dentro del fork del plugin:
+
+    git apply /ruta/a/plan-digest/plugin/paths.patch
+
+(si el upstream se movió y el hunk no aplica, el cambio es una sola línea:
+agregar `pathSignDigest(b),` a la lista que devuelve paths() en
+backend/accounts.go)
+
+--- a/backend/accounts.go
++++ b/backend/accounts.go
+@@ -47,8 +47,9 @@ func paths(b *backend) []*framework.Path {
+ func paths(b *backend) []*framework.Path {
+ 	return []*framework.Path{
+ 		pathCreateAndList(b),
+ 		pathReadAndDelete(b),
+ 		pathSign(b),
++		pathSignDigest(b),
+ 		pathExport(b),
+ 	}
+ }
