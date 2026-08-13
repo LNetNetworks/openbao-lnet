@@ -13,3 +13,6 @@ vault-init.txt
 seal.json
 seal*.json
 k8s/secrets-seal/
+
+# macOS
+.DS_Store
