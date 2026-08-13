@@ -117,6 +117,10 @@ Or via the HTTP API directly:
 curl -s -H "X-Vault-Token: $BAO_TOKEN" -d '{}' \
   http://127.0.0.1:8200/v1/ethereum/accounts
 
+  # Create a new key/account (returns its address)
+curl -s -H "X-Vault-Token: $BAO_TOKEN" -d '{}' \
+  https://vault.l-net.io/v1/ethereum/accounts
+
 # Sign a transaction with that account
 curl -s -H "X-Vault-Token: $BAO_TOKEN" -H "Content-Type: application/json" \
   -d '{
