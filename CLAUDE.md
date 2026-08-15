@@ -99,11 +99,12 @@ Four things to know before touching it:
 
 - **The plugin is a fork now.** Default build args point at
   [`LNetNetworks/vault-plugin-secrets-ethsign`](https://github.com/LNetNetworks/vault-plugin-secrets-ethsign),
-  branch `feat/sign-digest`, commit `236094bd56298a86364f397febd58644042256a8` —
-  one commit over upstream `efdc481c…`. **The repo must stay public** (`Dockerfile`
-  stage 1 clones without credentials) and **the branch must not be deleted** (the
-  pinned commit has to stay reachable). Upstream bumps are rebased, then
-  `ETHSIGN_REF` moves.
+  commit `236094bd56298a86364f397febd58644042256a8` — one commit over upstream
+  `efdc481c…`, reachable from `master`, from branch `feat/sign-digest` and from
+  the annotated tag `v0.1.0-sign-digest`. **The repo must stay public**
+  (`Dockerfile` stage 1 clones without credentials) and **the tag must not be
+  moved** — it is what keeps the pinned commit alive. Upstream bumps are rebased,
+  then `ETHSIGN_REF` moves.
 - **Byte 64 of `signature` is the raw recovery id (`0`/`1`)**, with `v_eth`
   (`27`/`28`) as a separate field — that is variant **A**
   ([`plan-digest/plugin/path_sign_digest.go`](plan-digest/plugin/path_sign_digest.go),

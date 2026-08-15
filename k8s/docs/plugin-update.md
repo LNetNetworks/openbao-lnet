@@ -135,7 +135,7 @@ sha256.
 | | |
 |---|---|
 | Repo | [`LNetNetworks/vault-plugin-secrets-ethsign`](https://github.com/LNetNetworks/vault-plugin-secrets-ethsign) (fork público de `kaleido-io/…`) |
-| Rama | `feat/sign-digest` |
+| Refs | `master`, rama `feat/sign-digest` y tag `v0.1.0-sign-digest` — los tres apuntan al mismo commit |
 | Commit | `236094bd56298a86364f397febd58644042256a8` ← **este es el `ETHSIGN_REF`** |
 | Base | `efdc481c29f9eb9a04c8c47e0636bdddc98b9163` (HEAD de upstream al forkear) |
 | Delta | `backend/path_sign_digest.go` + `backend/path_sign_digest_test.go` + 1 línea en `backend/accounts.go` |
@@ -150,8 +150,10 @@ ni lleva prefijo EIP-191. Con `CGO_ENABLED=0` se usa la implementación pura-Go 
 secp256k1 (btcec), también low-s canónica.
 
 **El repo tiene que seguir siendo público**: la etapa 1 del `Dockerfile` hace
-`git clone` sin credenciales. Y **la rama no se borra**: el commit pineado tiene
-que seguir siendo alcanzable.
+`git clone` sin credenciales — verificado clonando en limpio y compilando con el
+mismo comando de la stage 1 (`CGO_ENABLED=0 GOOS=linux go build -trimpath`). Y
+**el tag `v0.1.0-sign-digest` no se mueve**: es lo que mantiene vivo el commit
+pineado si algún día se borra la rama.
 
 Si algún día hay que rehacerlo (o partir de otro commit de upstream), esto es lo
 que se hizo:

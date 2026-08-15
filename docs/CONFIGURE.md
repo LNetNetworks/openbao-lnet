@@ -72,8 +72,10 @@ Se pasan a `docker compose build` (o `docker build --build-arg`). En el
 > - **Los bumps de upstream se rebasan.** Cuando salga una versión nueva del
 >   plugin: `git fetch upstream && git rebase upstream/master` sobre la rama del
 >   fork, `go test ./...`, y recién ahí mover `ETHSIGN_REF`.
-> - **La rama `feat/sign-digest` no se borra**: el commit pineado tiene que
->   seguir siendo alcanzable, o el build deja de encontrarlo.
+> - **El commit pineado tiene que seguir siendo alcanzable** o el build deja de
+>   encontrarlo. Hoy lo es por tres caminos —`master`, la rama
+>   `feat/sign-digest` y el tag anotado `v0.1.0-sign-digest`—, así que borrar
+>   una rama no rompe el build. **El tag no se toca ni se mueve.**
 >
 > Todo el procedimiento de despliegue del binario nuevo (incluida la ventana del
 > `sha256` en producción) está en
