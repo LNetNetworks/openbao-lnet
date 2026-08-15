@@ -7,7 +7,10 @@ unsigned transactions and get back signed, RLP-encoded transactions ready to
 broadcast.
 
 The signing engine is [`kaleido-io/vault-plugin-secrets-ethsign`](https://github.com/kaleido-io/vault-plugin-secrets-ethsign)
-(secp256k1 / EIP-155), built from source and baked into the image.
+(secp256k1 / EIP-155), built from source and baked into the image. It also signs
+**raw 32-byte digests** through a locally added endpoint,
+[`sign-digest`](#-sign-digest--signing-a-raw-32-byte-digest) — useful for
+Verifiable Credentials, and not part of upstream.
 
 > **Going to production?** This README covers the local Docker setup. The
 > Kubernetes deployment — 3-node Raft cluster on GKE with Cloud KMS auto-unseal,
@@ -25,6 +28,8 @@ The signing engine is [`kaleido-io/vault-plugin-secrets-ethsign`](https://github
 | `scripts/register-plugin.sh` | Registers + enables the `ethsign` engine in a running, unsealed server. |
 | `scripts/demo-sign.sh` | End-to-end demo: create an account and sign a transaction. |
 | `docker-compose.ha.yml` + `config/ha/` | 3-node Raft cluster on one host, to observe quorum/failover. Not real HA — see [`docs/ha-cluster.md`](docs/ha-cluster.md). |
+| `plugin/` | How the **`sign-digest`** endpoint was added to the plugin and validated in the local POC. |
+| `plan-digest/` | The package to fork the plugin with: endpoint source, Go test, verification script, example policies. |
 | `k8s/` | **Production deployment on Kubernetes** (Helm + ArgoCD, GKE, Cloud KMS auto-unseal, Kong ingress, GCS snapshots). |
 
 > The plugin is compiled with `CGO_ENABLED=0`, so go-ethereum uses its pure-Go
@@ -48,9 +53,18 @@ Optional build args (defaults shown):
 ```bash
 docker build -t openbao-lnet:latest \
   --build-arg OPENBAO_VERSION=latest \
-  --build-arg ETHSIGN_REF=efdc481c29f9eb9a04c8c47e0636bdddc98b9163 \
+  --build-arg ETHSIGN_REPO=https://github.com/LNetNetworks/vault-plugin-secrets-ethsign.git \
+  --build-arg ETHSIGN_REF=236094bd56298a86364f397febd58644042256a8 \
   .
 ```
+
+> Those are the **defaults** — the plugin is built from
+> [`LNetNetworks/vault-plugin-secrets-ethsign`](https://github.com/LNetNetworks/vault-plugin-secrets-ethsign),
+> a fork of Kaleido's whose only delta is the
+> [`sign-digest`](#-sign-digest--signing-a-raw-32-byte-digest) endpoint. To build
+> stock upstream instead (no `sign-digest`):
+> `--build-arg ETHSIGN_REPO=https://github.com/kaleido-io/vault-plugin-secrets-ethsign.git --build-arg ETHSIGN_REF=efdc481c29f9eb9a04c8c47e0636bdddc98b9163`.
+> See [`docs/CONFIGURE.md`](docs/CONFIGURE.md).
 
 ## 2. Start the server
 
@@ -148,10 +162,51 @@ The response contains `signed_transaction` (RLP-encoded, ready to broadcast via
 | Read account | `GET` | `/v1/ethereum/accounts/<address>` |
 | Export private key | `GET` | `/v1/ethereum/export/accounts/<address>` |
 | Sign transaction | `POST` | `/v1/ethereum/accounts/<address>/sign` |
+| **Sign raw digest** ★ | `POST` | `/v1/ethereum/accounts/<address>/sign-digest` |
 
 **Sign payload fields:** `to` (omit to deploy a contract), `data` (hex `0x…`),
 `value`, `nonce` (hex string, e.g. `"0x0"`), `gas`, `gasPrice`, and `chainId`
 (for EIP-155 replay protection — e.g. LACChain networks).
+
+### ★ `sign-digest` — signing a raw 32-byte digest
+
+> **Status:** a **fork-only endpoint**, not upstream. It ships in the default
+> build ([`LNetNetworks/vault-plugin-secrets-ethsign@236094bd`](https://github.com/LNetNetworks/vault-plugin-secrets-ethsign/tree/feat/sign-digest)),
+> with the plugin's Go test suite green. **Not deployed to production yet** —
+> the GKE image still runs the upstream binary, where this path returns
+> `unsupported path`.
+
+Signs a 32-byte digest **as-is** with the account's secp256k1 key: no
+transaction wrapping, no EIP-191 prefix (`"\x19Ethereum Signed Message:\n32"`),
+no re-hashing. The signature is recoverable and canonical low-s (EIP-2), so
+`ecrecover(digest, v, r, s)` yields the signing address. The use case is signing
+a Verifiable Credential's `credentialHash` directly.
+
+```bash
+curl -s -H "X-Vault-Token: $BAO_TOKEN" -H "Content-Type: application/json" \
+  -d '{"hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}' \
+  http://127.0.0.1:8200/v1/ethereum/accounts/<ADDRESS>/sign-digest
+```
+
+Response fields: `address`, `hash` (the normalized digest, as signed),
+`signature` (65 bytes, `r(32) ‖ s(32) ‖ v(1)`), `r`, `s`, `v` (raw recovery id,
+`0`/`1`) and `v_eth` (`27`/`28` — what Solidity's `ecrecover` expects). **Byte 64
+of `signature` carries the raw `0`/`1`**; use `v_eth` if you need the Ethereum
+convention.
+
+Verify a signature end-to-end (creates an account, signs, checks `ecrecover`):
+
+```bash
+BAO_TOKEN="$BAO_TOKEN" ./plan-digest/scripts/verify-sign-digest.sh
+```
+
+> ⚠️ **This endpoint is more powerful than `/sign`.** A transaction hash is just
+> `keccak256(RLP(tx))`, computable off-chain — so whoever can sign an arbitrary
+> digest can assemble a valid fund-moving transaction, bypassing any restriction
+> that relies on the vault building the transaction. Use a **dedicated account
+> with no balance** for digests, and separate policies with explicit cross-denies:
+> [`plan-digest/policies/ethsign-digest.hcl`](plan-digest/policies/ethsign-digest.hcl)
+> and [`k8s/docs/plugin-update.md` §6](k8s/docs/plugin-update.md).
 
 ## Teardown
 

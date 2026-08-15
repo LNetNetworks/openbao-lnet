@@ -9,8 +9,10 @@ A POC that packages [OpenBao](https://openbao.org) as a Docker image with the
 Ethereum signing plugin baked in. The vault acts like a cloud HSM: secp256k1
 private keys are generated/stored inside OpenBao and **never leave it**. Clients
 POST unsigned transactions and get back RLP-encoded signed transactions (EIP-155
-replay protection via `chainId`). This repo contains **no application source
-code** — it is a Dockerfile, config, and helper scripts around an upstream plugin.
+replay protection via `chainId`), or a **raw 32-byte digest** and get back
+`r‖s‖v` (the `sign-digest` endpoint, added locally — see below). Apart from that
+endpoint's source in [`plan-digest/plugin/`](plan-digest/README.md), this repo is
+a Dockerfile, config, and helper scripts around an upstream plugin.
 
 ## Architecture
 
@@ -78,10 +80,53 @@ BAO_TOKEN="$BAO_TOKEN" ./scripts/demo-sign.sh         # create account + sign a 
 | Read account | `GET` | `/accounts/<address>` |
 | Export private key | `GET` | `/export/accounts/<address>` |
 | Sign transaction | `POST` | `/accounts/<address>/sign` |
+| Sign raw digest ★ | `POST` | `/accounts/<address>/sign-digest` (body `{"hash":"0x<64 hex>"}`) |
 
 Sign payload fields: `to` (omit to deploy a contract), `data` (hex `0x…`),
 `value`, `nonce` (hex string, e.g. `"0x0"`), `gas`, `gasPrice`, `chainId`
 (EIP-155 — e.g. LACChain networks). Auth header on every call: `X-Vault-Token: $BAO_TOKEN`.
+
+### ★ `sign-digest` — not upstream, not in production yet
+
+Signs a **32-byte digest as-is**: no transaction wrapping, no EIP-191 prefix, no
+re-hashing. Returns a recoverable, canonical low-s (EIP-2) signature —
+`signature` = 65 bytes `r‖s‖v` — so `ecrecover(digest, v, r, s)` yields the
+account address. Exists because `/sign` derives its own digest
+(`keccak256(RLP(tx))`) and OpenBao's **Transit engine does not support
+secp256k1** (NIST curves only). Use case: signing a VC's `credentialHash`.
+
+Four things to know before touching it:
+
+- **The plugin is a fork now.** Default build args point at
+  [`LNetNetworks/vault-plugin-secrets-ethsign`](https://github.com/LNetNetworks/vault-plugin-secrets-ethsign),
+  branch `feat/sign-digest`, commit `236094bd56298a86364f397febd58644042256a8` —
+  one commit over upstream `efdc481c…`. **The repo must stay public** (`Dockerfile`
+  stage 1 clones without credentials) and **the branch must not be deleted** (the
+  pinned commit has to stay reachable). Upstream bumps are rebased, then
+  `ETHSIGN_REF` moves.
+- **Byte 64 of `signature` is the raw recovery id (`0`/`1`)**, with `v_eth`
+  (`27`/`28`) as a separate field — that is variant **A**
+  ([`plan-digest/plugin/path_sign_digest.go`](plan-digest/plugin/path_sign_digest.go),
+  the one with the Go test). The other variant, in
+  [`plugin/guide-implementation-sign-digest.md`](plugin/guide-implementation-sign-digest.md),
+  normalizes byte 64 to `27`/`28` instead; it is **not** what the fork ships.
+  Changing this later means another image and another rollout.
+- **It is more powerful than `/sign`.** A transaction hash is just
+  `keccak256(RLP(tx))`, computable off-chain, so digest-signing rights ⇒ ability
+  to sign any transaction. Mitigation is not optional: dedicated account with no
+  balance, separate policies with cross-`deny`
+  ([`plan-digest/policies/ethsign-digest.hcl`](plan-digest/policies/ethsign-digest.hcl)).
+- **The `ethsign-signer` policy does not cover it.** `path "…/accounts/+/sign"`
+  has no trailing `*`, so `sign-digest` is denied by default — correct, and it
+  should stay that way. Consumers need their own policy + K8s auth role.
+
+Status: fork created and its Go test suite green; it is the **default** of the
+local build. **Production still runs the upstream binary** (image tag `3fd9333`)
+— rolling it out is pending. Where things live —
+[`plugin/`](plugin/guide-implementation-sign-digest.md) (how it was built and the
+three problems hit locally), [`plan-digest/`](plan-digest/README.md) (fork
+package: source, Go test, `scripts/verify-sign-digest.sh`, policies),
+[`k8s/docs/plugin-update.md`](k8s/docs/plugin-update.md) (deploying it to GKE).
 
 ## Production on Kubernetes — `k8s/` (implemented)
 
@@ -122,6 +167,12 @@ is **the only file copied** into
   Zone loss ⇒ snapshot restore, RPO up to 6h.
 - CI builds the image automatically but **the tag bump is a manual job** —
   a stateful vault must not roll on every commit.
+- Changing the plugin **binary** means re-registering its `sha256`. Between the
+  rollout finishing and the re-register, every call to `ethereum/*` fails with
+  `checksums did not match` **while the pods still report `1/1 Ready`** (readiness
+  probes `bao status`, not the engine). And with the root token revoked, you need
+  `generate-root` with 3 recovery keys *before* starting. See
+  [`k8s/docs/plugin-update.md`](k8s/docs/plugin-update.md).
 
 ### Background docs (Spanish, the rationale)
 
@@ -162,5 +213,8 @@ all config knobs — build args (`ETHSIGN_REF` = pinned plugin commit,
 For **production on Kubernetes**, the authoritative set is under `k8s/docs/`:
 `deployment.md` (step by step), `unseal-keys.md` (key custody, rotation, disaster
 scenarios), `kong-ingress.md` (the edge and its three gotchas), `operations.md`
-(runbook: failover, restore, upgrades, scaling). `docs/storage.md` and
+(runbook: failover, restore, upgrades, scaling), `plugin-update.md` (changing the
+plugin **binary** — the `sha256` window, the permissions it needs, and the
+policies `sign-digest` requires), `redeploy-clean.md` (throwing the cluster away
+and rebuilding it with a **new seal key** — only while no keys are worth keeping). `docs/storage.md` and
 `docs/dr-plan.md` hold the rationale behind those choices.

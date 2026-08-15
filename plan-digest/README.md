@@ -1,9 +1,17 @@
 # Plan: firmar digests crudos (32 bytes) con el bao
 
-> **Estado: PLANIFICADO, no implementado.** Nada de esta carpeta está desplegado
-> ni cambia el comportamiento actual del vault. Es el paquete listo para
-> ejecutar cuando se decida hacerlo: el código, el test, el script de
-> verificación y los pasos de despliegue.
+> **Estado (2026-08-14): el fork YA EXISTE.** El código de esta carpeta está
+> mergeado en
+> [`LNetNetworks/vault-plugin-secrets-ethsign@236094bd`](https://github.com/LNetNetworks/vault-plugin-secrets-ethsign/tree/feat/sign-digest)
+> (rama `feat/sign-digest`, un commit sobre el `efdc481c…` de upstream), con
+> `go build` y la suite completa en verde, y es el **default** de
+> `Dockerfile`/`docker-compose.yml`/CI. Lo que falta es el **despliegue a
+> producción**: hoy GKE sigue corriendo el binario de upstream. Procedimiento en
+> [`../k8s/docs/plugin-update.md`](../k8s/docs/plugin-update.md) — o, si el
+> cluster no está en uso, [`../k8s/docs/redeploy-clean.md`](../k8s/docs/redeploy-clean.md).
+>
+> Esta carpeta se conserva como **fuente del delta**: si hay que rehacer el fork
+> o rebasarlo sobre un upstream nuevo, se parte de acá.
 >
 > Fecha del análisis: 2026-08-12. Verificado contra el plugin en el commit que
 > hoy corre en producción: `ETHSIGN_REF=efdc481c29f9eb9a04c8c47e0636bdddc98b9163`
@@ -124,10 +132,10 @@ Mitigación (no opcional):
 
 ## Pasos de implementación
 
-1. **Fork** de `kaleido-io/vault-plugin-secrets-ethsign` (destino a definir:
-   probablemente `LNetNetworks/vault-plugin-secrets-ethsign`), branch desde el
-   commit pineado `efdc481c…` — no desde `master`, para que el único delta sea
-   este endpoint.
+1. ~~**Fork** de `kaleido-io/vault-plugin-secrets-ethsign`~~ — **hecho**:
+   `LNetNetworks/vault-plugin-secrets-ethsign`, rama `feat/sign-digest` desde el
+   commit pineado `efdc481c…` (no desde `master`, para que el único delta sea
+   este endpoint).
 2. Copiar `plugin/path_sign_digest.go` → `backend/path_sign_digest.go`,
    `plugin/path_sign_digest_test.go` → `backend/path_sign_digest_test.go`, y
    `git apply plugin/paths.patch`.
