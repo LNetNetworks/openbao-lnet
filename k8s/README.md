@@ -33,7 +33,9 @@ k8s/
     ├── unseal-keys.md             recovery keys: custodia, rotación, desastres
     ├── kong-ingress.md            el Ingress y sus tres puntos de atención
     ├── edge-client-ip.md          ⚠ por qué Kong no ve la IP del cliente y qué hacer
-    └── operations.md              runbook: failover, restore, upgrades, escalado
+    ├── operations.md              runbook: failover, restore, upgrades, escalado
+    ├── plugin-update.md           actualizar el binario del plugin (caso sign-digest)
+    └── redeploy-clean.md          tirar el cluster y levantarlo de cero (key de sellado nueva)
 ```
 
 ---

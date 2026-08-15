@@ -379,8 +379,10 @@ El JSON contiene 5 recovery keys y el `root_token`. Ver
 > En cuanto verifiques que Secret Manager tiene el material, **borralas**:
 >
 > ```bash
-> gcloud secrets versions access 1 \
+> gcloud secrets versions access latest \
 >   --secret=openbao-prod-recovery --project=l-net-469615 | head -c 80
+> # `latest`, NO `1`: si el cluster se redesplegó alguna vez, la versión 1 es el
+> # material del linaje viejo — ver redeploy-clean.md.
 >
 > rm -f seal.json k8s/secrets-seal/seal.json
 > ```
@@ -434,7 +436,9 @@ a restarts.
 
 > **Cuándo hay que repetirlo:** cada vez que cambie el *binario* del plugin
 > (bump de `ETHSIGN_REF`). El sha256 registrado tiene que coincidir con el del
-> archivo o OpenBao se niega a ejecutarlo.
+> archivo o OpenBao se niega a ejecutarlo. Procedimiento completo de ese caso —
+> con la ventana de fallo que abre y los permisos que hacen falta — en
+> [`plugin-update.md`](plugin-update.md).
 
 ---
 
@@ -764,6 +768,11 @@ Usar siempre `openbao-active` (apunta al líder), no `openbao`.
   cliente, por qué este despliegue necesita un allowlist, y las opciones para
   arreglarlo en el edge.
 - [`operations.md`](operations.md) — runbook: failover, restore, upgrades, escalado.
+- [`plugin-update.md`](plugin-update.md) — actualizar el binario del plugin
+  ethsign (endpoint `sign-digest`) sin romper el mount `ethereum/`.
+- [`redeploy-clean.md`](redeploy-clean.md) — tirar este despliegue y levantarlo de
+  cero con una key de sellado nueva. Qué borrar (los PVCs **no** se van solos) y
+  en qué orden.
 - [`../../docs/storage.md`](../../docs/storage.md) — por qué Raft y no PostgreSQL.
 - [`../../docs/throughput.md`](../../docs/throughput.md) — **HA ≠ throughput**, y el
   cuello de botella real (nonces).

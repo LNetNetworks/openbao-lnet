@@ -167,6 +167,12 @@ líder).
 BAO_TOKEN=$BAO_TOKEN ./k8s/scripts/register-plugin.sh
 ```
 
+> Ese caso tiene su propia guía: [`plugin-update.md`](plugin-update.md). No es
+> solo el re-registro — hay una **ventana en la que `ethereum/*` falla** con
+> `checksums did not match` mientras los pods ya corren el binario nuevo y el
+> catálogo tiene el sha viejo, y con el root token revocado hace falta
+> `generate-root` con 3 recovery keys **antes** de empezar.
+
 ### Subir el chart de Helm
 
 Editar `targetRevision` en la Application. **Leer antes el changelog del chart**:
@@ -316,6 +322,10 @@ Honestidad sobre los límites, para que nadie asuma de más:
 ## Ver también
 
 - [`deployment.md`](deployment.md) — el despliegue desde cero.
+- [`plugin-update.md`](plugin-update.md) — actualizar el binario del plugin
+  ethsign (caso `sign-digest`): fork, imagen, re-registro del sha256 y políticas.
+- [`redeploy-clean.md`](redeploy-clean.md) — reemplazar el cluster entero por uno
+  nuevo (key de sellado nueva, init nuevo). Solo si no hay llaves que conservar.
 - [`unseal-keys.md`](unseal-keys.md) — recovery keys y escenarios de desastre.
 - [`kong-ingress.md`](kong-ingress.md) — el edge y sus trampas.
 - [`edge-client-ip.md`](edge-client-ip.md) — por qué Kong no ve la IP del cliente.
