@@ -5,7 +5,10 @@ services:
       # Build args (OPENBAO_VERSION, ETHSIGN_REF) documented in docs/CONFIGURE.md
       args:
         OPENBAO_VERSION: ${OPENBAO_VERSION:-latest}
-        ETHSIGN_REF: ${ETHSIGN_REF:-efdc481c29f9eb9a04c8c47e0636bdddc98b9163}
+        # Fork con el endpoint sign-digest (rama feat/sign-digest, un solo commit
+        # sobre el efdc481c… de upstream). Ver docs/CONFIGURE.md.
+        ETHSIGN_REPO: ${ETHSIGN_REPO:-https://github.com/LNetNetworks/vault-plugin-secrets-ethsign.git}
+        ETHSIGN_REF: ${ETHSIGN_REF:-236094bd56298a86364f397febd58644042256a8}
     image: openbao-lnet:latest
     container_name: openbao-lnet
     ports:

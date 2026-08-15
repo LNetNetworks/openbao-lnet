@@ -62,6 +62,11 @@ variables:
   # k8s/argocd/openbao-application.yaml (targetRevision 0.28.6 → v2.6.1).
   # Si divergen, el binario del servidor y los defaults del chart se desalinean.
   OPENBAO_VERSION: "2.6.1"
+  # Fork del plugin con el endpoint sign-digest. Son los mismos defaults que el
+  # Dockerfile; se declaran igual acá para que el bump sea explícito y quede en
+  # el log del pipeline qué commit del plugin se compiló.
+  ETHSIGN_REPO: "https://github.com/LNetNetworks/vault-plugin-secrets-ethsign.git"
+  ETHSIGN_REF: "236094bd56298a86364f397febd58644042256a8"
 
 # -----------------------------------------------------------------------------
 # build — automático. Publica la imagen; NO despliega nada.
@@ -73,9 +78,13 @@ build:
         - Dockerfile
         - config/**/*
         - scripts/**/*
+        # Un bump de ETHSIGN_REF (el commit del fork del plugin) se edita ACÁ, no
+        # en el Dockerfile: sin esta línea el cambio no dispara ningún build y el
+        # despliegue se queda con el binario viejo, en silencio.
+        - .gitlab-ci.yml
   variables:
     # El template pasa los build-args al `docker build`.
-    DOCKER_BUILD_ARGS: "--build-arg OPENBAO_VERSION=${OPENBAO_VERSION}"
+    DOCKER_BUILD_ARGS: "--build-arg OPENBAO_VERSION=${OPENBAO_VERSION} --build-arg ETHSIGN_REPO=${ETHSIGN_REPO} --build-arg ETHSIGN_REF=${ETHSIGN_REF}"
 
 # -----------------------------------------------------------------------------
 # bump-image-tag — MANUAL. Este job ES el deploy.

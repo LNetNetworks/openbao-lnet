@@ -13,11 +13,15 @@ Se pasan a `docker compose build` (o `docker build --build-arg`). En el
 
 ### `ETHSIGN_REF`
 
-- **Valor por defecto:** `efdc481c29f9eb9a04c8c47e0636bdddc98b9163`
+- **Valor por defecto:** `236094bd56298a86364f397febd58644042256a8`
+  (rama `feat/sign-digest` del fork — ver `ETHSIGN_REPO` abajo)
 - **Qué es:** un **hash de commit de git** (SHA-1, 40 chars hex) del repositorio
-  [`kaleido-io/vault-plugin-secrets-ethsign`](https://github.com/kaleido-io/vault-plugin-secrets-ethsign).
-  Es la **versión exacta del plugin de firma Ethereum** que se compila y se hornea
-  en la imagen.
+  que indique `ETHSIGN_REPO`. Es la **versión exacta del plugin de firma
+  Ethereum** que se compila y se hornea en la imagen.
+- **De dónde sale este commit:** es **un solo commit** encima de
+  `efdc481c29f9eb9a04c8c47e0636bdddc98b9163` (el HEAD de upstream cuando se
+  forkeó), que agrega el endpoint `sign-digest`. Para volver al plugin de
+  upstream tal cual, poné ese `efdc481c…` — pero perdés `sign-digest`.
 - **Cómo se usa:** en la etapa 1 del `Dockerfile`, el build hace literalmente:
   ```dockerfile
   RUN git clone "${ETHSIGN_REPO}" . && git checkout "${ETHSIGN_REF}"
@@ -49,9 +53,31 @@ Se pasan a `docker compose build` (o `docker build --build-arg`). En el
 
 ### `ETHSIGN_REPO`
 
-- **Valor por defecto:** `https://github.com/kaleido-io/vault-plugin-secrets-ethsign.git`
-- **Qué es:** el repositorio del plugin a clonar. Solo defínelo en el `Dockerfile`
-  (no está expuesto en `docker-compose.yml`). Cámbialo únicamente si usas un fork.
+- **Valor por defecto:** `https://github.com/LNetNetworks/vault-plugin-secrets-ethsign.git`
+- **Qué es:** el repositorio del plugin a clonar. Está expuesto como build arg en
+  el `Dockerfile`, en `docker-compose.yml` y en el pipeline
+  ([`k8s/ci/gitlab-ci.example.yml`](../k8s/ci/gitlab-ci.example.yml)).
+
+> **Esto es un FORK, y hay que tratarlo como tal.** El repositorio de upstream es
+> [`kaleido-io/vault-plugin-secrets-ethsign`](https://github.com/kaleido-io/vault-plugin-secrets-ethsign);
+> el fork de LNetNetworks existe por una sola razón: el endpoint **`sign-digest`**
+> (firma de digests crudos de 32 bytes), que upstream no tiene y que no se puede
+> resolver con el motor Transit de OpenBao porque no soporta secp256k1. El delta
+> es **un archivo nuevo + una línea** en `backend/accounts.go`.
+>
+> Consecuencias prácticas:
+>
+> - **El repo debe ser público.** La etapa 1 del `Dockerfile` hace `git clone`
+>   sin credenciales; con un repo privado, el build y el CI fallarían.
+> - **Los bumps de upstream se rebasan.** Cuando salga una versión nueva del
+>   plugin: `git fetch upstream && git rebase upstream/master` sobre la rama del
+>   fork, `go test ./...`, y recién ahí mover `ETHSIGN_REF`.
+> - **La rama `feat/sign-digest` no se borra**: el commit pineado tiene que
+>   seguir siendo alcanzable, o el build deja de encontrarlo.
+>
+> Todo el procedimiento de despliegue del binario nuevo (incluida la ventana del
+> `sha256` en producción) está en
+> [`k8s/docs/plugin-update.md`](../k8s/docs/plugin-update.md).
 
 ### `OPENBAO_VERSION`
 

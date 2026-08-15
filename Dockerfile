@@ -14,9 +14,13 @@ FROM golang:1.23-alpine AS builder
 
 RUN apk add --no-cache git
 
-ARG ETHSIGN_REPO=https://github.com/kaleido-io/vault-plugin-secrets-ethsign.git
+# FORK of kaleido-io/vault-plugin-secrets-ethsign. The only delta against
+# upstream is the `sign-digest` endpoint (raw 32-byte secp256k1 digests), on
+# branch feat/sign-digest, branched from the upstream commit efdc481c…
+# Upstream: https://github.com/kaleido-io/vault-plugin-secrets-ethsign.git
+ARG ETHSIGN_REPO=https://github.com/LNetNetworks/vault-plugin-secrets-ethsign.git
 # Pin to a specific commit for reproducible builds (override with a branch/tag/commit).
-ARG ETHSIGN_REF=efdc481c29f9eb9a04c8c47e0636bdddc98b9163
+ARG ETHSIGN_REF=236094bd56298a86364f397febd58644042256a8
 
 WORKDIR /src
 RUN git clone "${ETHSIGN_REPO}" . && git checkout "${ETHSIGN_REF}"
