@@ -11,9 +11,16 @@
 #
 # El paso 2 provoca un failover REAL. Se puede saltar con SKIP_FAILOVER=1.
 #
+# BAO_TOKEN es OPCIONAL. Lo normal en este despliegue es NO tener uno: el root
+# token se revoca al terminar el bootstrap, y conseguir otro exige `generate-root`
+# con 3 de las 5 recovery keys. Sin token se corre todo lo que no necesita
+# credenciales (quórum, failover, edge) y los dos chequeos que sí las necesitan
+# se reportan como SALTADOS, no como fallos.
+#
 # Uso:
-#   BAO_TOKEN=<token> ./k8s/scripts/smoke-test.sh
-#   SKIP_FAILOVER=1 BAO_TOKEN=<token> ./k8s/scripts/smoke-test.sh
+#   ./k8s/scripts/smoke-test.sh                      # sin token: salud del cluster
+#   BAO_TOKEN=<token> ./k8s/scripts/smoke-test.sh    # completo, con firma real
+#   SKIP_FAILOVER=1 ./k8s/scripts/smoke-test.sh      # sin tocar el liderazgo
 #
 set -euo pipefail
 
@@ -23,13 +30,32 @@ BAO_ADDR="${BAO_ADDR:-https://${HOST}}"
 MOUNT_PATH="${MOUNT_PATH:-ethereum}"
 CHAIN_ID="${CHAIN_ID:-648529}"
 SKIP_FAILOVER="${SKIP_FAILOVER:-}"
-
-: "${BAO_TOKEN:?Exportá BAO_TOKEN}"
+BAO_TOKEN="${BAO_TOKEN:-}"
 
 pass() { printf '  \033[0;32m✓\033[0m %s\n' "$*"; }
 fail() { printf '  \033[0;31m✗\033[0m %s\n' "$*"; FAILURES=$((FAILURES+1)); }
 warn() { printf '  \033[0;33m!\033[0m %s\n' "$*"; }
+skip() { printf '  \033[0;36m⊘\033[0m %s\n' "$*"; SKIPPED=$((SKIPPED+1)); }
 FAILURES=0
+SKIPPED=0
+
+# Estado del token: ausente | invalido | ok. Se resuelve en el paso 1, en cuanto
+# se conoce el pod activo. Validarlo ANTES de usarlo es lo que evita el fallo más
+# confuso de este script: un token revocado hace que `raft list-peers` devuelva
+# 403, la salida quede vacía, y el conteo de peers dé 0 — que se lee como pérdida
+# de quórum cuando el cluster está perfecto.
+TOKEN_STATE=ausente
+
+generate_root_hint() {
+  cat <<EOF
+      Para obtener un token administrativo hacen falta 3 de las 5 recovery keys:
+          kubectl -n ${NAMESPACE} exec -it ${1:-openbao-0} -- bao operator generate-root -init
+          # aportar los 3 shares, y después:
+          kubectl -n ${NAMESPACE} exec -it ${1:-openbao-0} -- \\
+            bao operator generate-root -decode=<encoded> -otp=<otp>
+      Revocalo al terminar:  bao token revoke -self
+EOF
+}
 
 active_pod() {
   kubectl -n "${NAMESPACE}" get pods \
@@ -48,11 +74,56 @@ READY="$(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=openbao \
 ACTIVE="$(active_pod)"
 [[ -n "${ACTIVE}" ]] && pass "líder: ${ACTIVE}" || fail "no hay pod con openbao-active=true"
 
-PEERS="$(kubectl -n "${NAMESPACE}" exec -i "${ACTIVE}" \
-  -- env BAO_TOKEN="${BAO_TOKEN}" bao operator raft list-peers 2>/dev/null || true)"
-echo "${PEERS}" | sed 's/^/      /'
-PEER_COUNT="$(echo "${PEERS}" | grep -c "openbao-" || true)"
-[[ "${PEER_COUNT}" -eq 3 ]] && pass "3 peers en el quórum" || fail "${PEER_COUNT} peers (esperaba 3)"
+# --- Estado del token, antes de usarlo para nada -------------------------------
+if [[ -z "${BAO_TOKEN}" ]]; then
+  TOKEN_STATE=ausente
+elif [[ -n "${ACTIVE}" ]] && kubectl -n "${NAMESPACE}" exec -i "${ACTIVE}" \
+       -- env BAO_TOKEN="${BAO_TOKEN}" bao token lookup >/dev/null 2>&1; then
+  TOKEN_STATE=ok
+  pass "BAO_TOKEN válido"
+else
+  TOKEN_STATE=invalido
+  warn "BAO_TOKEN definido pero NO válido (revocado o expirado) — los chequeos que"
+  warn "necesitan credenciales se saltean; el resto corre igual"
+  generate_root_hint "${ACTIVE}"
+fi
+
+# --- Quórum: sin token, mirando cada réplica ----------------------------------
+# `raft list-peers` necesita credenciales, pero la salud del quórum no: si los
+# tres nodos están desellados y comparten el mismo Raft Applied Index, están
+# replicando. Este chequeo corre SIEMPRE.
+QUORUM_OK=1
+INDEXES=""
+for POD in $(kubectl -n "${NAMESPACE}" get pods -l app.kubernetes.io/name=openbao \
+               -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+  ST="$(kubectl -n "${NAMESPACE}" exec -i "${POD}" -- bao status 2>/dev/null || true)"
+  MODE="$(echo "${ST}" | awk '/^HA Mode/{print $NF}')"
+  IDX="$(echo "${ST}" | awk '/^Raft Applied Index/{print $NF}')"
+  printf '      %-12s %-8s applied=%s\n' "${POD}" "${MODE:-?}" "${IDX:-?}"
+  [[ -z "${MODE}" || -z "${IDX}" ]] && QUORUM_OK=0
+  INDEXES="${INDEXES} ${IDX}"
+done
+UNIQ_IDX="$(echo "${INDEXES}" | tr ' ' '\n' | grep -v '^$' | sort -u | wc -l | tr -d ' ')"
+if [[ "${QUORUM_OK}" -eq 1 && "${UNIQ_IDX}" -eq 1 ]]; then
+  pass "los 3 nodos replicando en el mismo índice de Raft"
+elif [[ "${QUORUM_OK}" -eq 1 ]]; then
+  # Un índice distinto puede ser un follower atrasado unos ms: es warn, no fallo.
+  warn "índices de Raft distintos (${INDEXES# }) — puede ser lag normal; repetir"
+else
+  fail "algún nodo no respondió a 'bao status': el quórum está comprometido"
+fi
+
+# `list-peers` aporta el rol de votante, que el chequeo de arriba no ve.
+if [[ "${TOKEN_STATE}" == "ok" ]]; then
+  PEERS="$(kubectl -n "${NAMESPACE}" exec -i "${ACTIVE}" \
+    -- env BAO_TOKEN="${BAO_TOKEN}" bao operator raft list-peers 2>/dev/null || true)"
+  echo "${PEERS}" | sed 's/^/      /'
+  PEER_COUNT="$(echo "${PEERS}" | grep -c "openbao-" || true)"
+  [[ "${PEER_COUNT}" -eq 3 ]] && pass "3 peers votantes en el quórum" \
+    || fail "${PEER_COUNT} peers (esperaba 3)"
+else
+  skip "list-peers — BAO_TOKEN ${TOKEN_STATE}; el quórum ya quedó verificado arriba"
+fi
 
 SEALED="$(kubectl -n "${NAMESPACE}" exec -i "${ACTIVE}" -- bao status -format=json 2>/dev/null \
   | grep -o '"sealed": *[a-z]*' | awk '{print $2}')"
@@ -173,15 +244,40 @@ EOF
 echo
 echo "[5/5] Firma end-to-end vía ${BAO_ADDR}"
 # ===========================================================================
+if [[ "${TOKEN_STATE}" != "ok" ]]; then
+  skip "firma end-to-end — BAO_TOKEN ${TOKEN_STATE}; necesita un token administrativo"
+  echo "      Lo demás ya se verificó: el cluster está sano y el edge responde."
+  generate_root_hint "${ACTIVE}"
+  echo
+  if [[ "${FAILURES}" -eq 0 ]]; then
+    printf '\033[0;32mSmoke test OK\033[0m — %d fallos, %d saltados (sin token)\n' \
+      "${FAILURES}" "${SKIPPED}"
+    exit 0
+  else
+    printf '\033[0;31mSmoke test con %d fallo(s)\033[0m, %d saltados\n' "${FAILURES}" "${SKIPPED}"
+    exit 1
+  fi
+fi
+
 hdr=(-H "X-Vault-Token: ${BAO_TOKEN}" -H "Content-Type: application/json")
 
-ACCOUNT_JSON="$(curl -s "${hdr[@]}" -d '{}' "${BAO_ADDR}/v1/${MOUNT_PATH}/accounts" || true)"
+# UNA sola llamada: el código HTTP va en la última línea (cada POST a /accounts
+# genera una llave nueva, así que pedirlo dos veces ensuciaría el vault).
+ACCOUNT_RAW="$(curl -s -w '\n%{http_code}' "${hdr[@]}" -d '{}' \
+  "${BAO_ADDR}/v1/${MOUNT_PATH}/accounts" || echo $'\n000')"
+ACCOUNT_CODE="$(printf '%s' "${ACCOUNT_RAW}" | tail -n1)"
+ACCOUNT_JSON="$(printf '%s' "${ACCOUNT_RAW}" | sed '$d')"
 ADDRESS="$(echo "${ACCOUNT_JSON}" | sed -n 's/.*"address":"\([^"]*\)".*/\1/p')"
 if [[ -n "${ADDRESS}" ]]; then
   pass "cuenta creada: ${ADDRESS}"
+elif [[ "${ACCOUNT_CODE}" == "403" ]]; then
+  # El token pasó el lookup pero no tiene permisos sobre el engine: es un
+  # problema de POLÍTICA, no de credencial ni de cluster.
+  fail "403 al crear la cuenta: el token es válido pero su política no cubre ${MOUNT_PATH}/accounts"
+  echo; printf 'Fallos: %d\n' "${FAILURES}"; exit 1
 else
-  fail "no se pudo crear la cuenta: ${ACCOUNT_JSON}"
-  echo; echo "Fallos: ${FAILURES}"; exit 1
+  fail "no se pudo crear la cuenta (HTTP ${ACCOUNT_CODE}): ${ACCOUNT_JSON}"
+  echo; printf 'Fallos: %d\n' "${FAILURES}"; exit 1
 fi
 
 SIGNED="$(curl -s "${hdr[@]}" -d "{
@@ -214,8 +310,8 @@ fi
 # ===========================================================================
 echo
 if [[ "${FAILURES}" -eq 0 ]]; then
-  printf '\033[0;32mSmoke test OK\033[0m — %d fallos\n' "${FAILURES}"
+  printf '\033[0;32mSmoke test OK\033[0m — %d fallos, %d saltados\n' "${FAILURES}" "${SKIPPED}"
 else
-  printf '\033[0;31mSmoke test con %d fallo(s)\033[0m\n' "${FAILURES}"
+  printf '\033[0;31mSmoke test con %d fallo(s)\033[0m, %d saltados\n' "${FAILURES}" "${SKIPPED}"
   exit 1
 fi
