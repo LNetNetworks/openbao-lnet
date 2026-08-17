@@ -5,6 +5,13 @@
 #
 # IDEMPOTENTE: se puede correr de nuevo tras un cambio de políticas.
 #
+# El script PRUEBA el camino de vuelta antes de sugerir la revocación: emite un
+# token por el rol de operador y comprueba que puede leer sys/mounts. Si eso
+# falla, aborta. En OpenBao ≥2.6.0 las recovery keys NO acuñan un root token por
+# sí solas (`generate-root` pasó a ser un endpoint autenticado), así que ese rol
+# es la única vía de administración cuando no hay root token.
+# Ver k8s/docs/admin-access-recovery.md.
+#
 # Después de esto, ningún consumidor usa un token estático: cada pod se
 # autentica con su ServiceAccount de Kubernetes y recibe un token de vida corta.
 #
@@ -18,6 +25,11 @@ MOUNT_PATH="${MOUNT_PATH:-ethereum}"
 # Namespaces cuyos pods pueden pedir firmas. Ajustar a los consumidores reales.
 SIGNER_NAMESPACES="${SIGNER_NAMESPACES:-naas,ppr,lnet-tools}"
 SIGNER_SERVICE_ACCOUNTS="${SIGNER_SERVICE_ACCOUNTS:-*}"
+# ServiceAccount (en el namespace de OpenBao) que da acceso administrativo.
+# Quien pueda `kubectl create token` sobre ella es operador del vault.
+OPERATOR_SA="${OPERATOR_SA:-openbao-operator}"
+
+red() { printf '\033[0;31m%s\033[0m\n' "$*" >&2; }
 
 : "${BAO_TOKEN:?Exportá BAO_TOKEN con el root token}"
 
@@ -191,6 +203,65 @@ kexec bao write auth/kubernetes/role/snapshot \
   max_ttl=30m
 
 # ---------------------------------------------------------------------------
+# 4b. Rol de OPERADOR — el camino de vuelta cuando no hay root token
+#
+# ESTO NO ES OPCIONAL. Desde OpenBao 2.6.0 `bao operator generate-root` usa un
+# endpoint AUTENTICADO (`sys/generate-root-token`): las recovery keys por sí
+# solas NO acuñan un root token. Sin un rol que entregue la política
+# `openbao-operator`, revocar el root token deja el vault sin ninguna vía de
+# administración — no se puede crear una política, un rol, ni montar un engine.
+# Pasó en producción el 2026-08-17. Ver k8s/docs/admin-access-recovery.md.
+#
+# El control de acceso se delega en el RBAC de Kubernetes: quien pueda hacer
+# `kubectl create token openbao-operator -n openbao` obtiene un token de
+# operador. Eso es auditable y ya existe, a diferencia de un token estático.
+# ---------------------------------------------------------------------------
+echo "==> ServiceAccount '${OPERATOR_SA}' en ${NAMESPACE} (identidad del operador)"
+kubectl -n "${NAMESPACE}" create serviceaccount "${OPERATOR_SA}" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+echo "==> Rol '${OPERATOR_SA}' (TTL corto: es acceso administrativo)"
+kexec bao write "auth/kubernetes/role/${OPERATOR_SA}" \
+  bound_service_account_names="${OPERATOR_SA}" \
+  bound_service_account_namespaces="${NAMESPACE}" \
+  policies=openbao-operator \
+  ttl=30m \
+  max_ttl=2h
+
+# --- Auto-test: el camino de vuelta se PRUEBA antes de ofrecer revocar --------
+# La lección del 2026-08-17: verificar que la revocación funcionó no sirve de
+# nada si no se verificó primero que se puede volver a entrar.
+echo "==> Probando el camino de vuelta (login por auth/kubernetes con ${OPERATOR_SA})"
+OPERATOR_JWT="$(kubectl -n "${NAMESPACE}" create token "${OPERATOR_SA}" --duration=600s 2>/dev/null || true)"
+OPERATOR_TOKEN=""
+if [[ -n "${OPERATOR_JWT}" ]]; then
+  OPERATOR_LOGIN="$(kexec sh -c "BAO_TOKEN= bao write -format=json auth/kubernetes/login \
+    role=${OPERATOR_SA} jwt='${OPERATOR_JWT}'" 2>/dev/null || true)"
+  OPERATOR_TOKEN="$(printf '%s' "${OPERATOR_LOGIN}" \
+    | sed -n 's/.*"client_token": *"\([^"]*\)".*/\1/p' | head -1)"
+fi
+
+if [[ -z "${OPERATOR_TOKEN}" ]]; then
+  red "El login del rol '${OPERATOR_SA}' NO funcionó."
+  echo "NO revoques el root token: te quedarías sin acceso administrativo y en"
+  echo "este build las recovery keys no lo devuelven (ver"
+  echo "k8s/docs/admin-access-recovery.md). Revisá auth/kubernetes/config y la"
+  echo "ServiceAccount ${NAMESPACE}/${OPERATOR_SA} antes de seguir."
+  exit 1
+fi
+
+# Que el token exista no alcanza: tiene que poder hacer trabajo de operador.
+if kexec sh -c "BAO_TOKEN='${OPERATOR_TOKEN}' bao read sys/mounts" >/dev/null 2>&1; then
+  echo "    OK — el token de operador lee sys/mounts. El camino de vuelta existe."
+  kexec sh -c "BAO_TOKEN='${OPERATOR_TOKEN}' bao token revoke -self" >/dev/null 2>&1 || true
+else
+  red "El token de operador se emitió pero NO puede leer sys/mounts."
+  echo "La política 'openbao-operator' no está haciendo efecto. NO revoques el"
+  echo "root token hasta resolverlo."
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Revocación del root token
 # ---------------------------------------------------------------------------
 cat <<EOF
@@ -201,18 +272,26 @@ Bootstrap completo. Resumen:
   audit device   → /openbao/audit/audit.log
   autopilot      → cleanup_dead_servers, min_quorum=3
   políticas      → ethsign-signer, snapshot, openbao-operator
-  auth k8s       → roles ethsign-signer, snapshot
+  auth k8s       → roles ethsign-signer, snapshot, ${OPERATOR_SA}
+  camino de vuelta PROBADO → login de ${OPERATOR_SA} + read sys/mounts OK
 
 ÚLTIMO PASO RECOMENDADO: revocar el root token.
 
-Un root token vivo e indefinido es la peor deuda de seguridad de un vault.
-Se regenera cuando haga falta con 3 de las 5 recovery keys:
+Un root token vivo e indefinido es la peor deuda de seguridad de un vault. Y
+ahora es seguro revocarlo, porque el camino de vuelta se acaba de verificar:
 
-    kubectl -n ${NAMESPACE} exec -it ${ACTIVE_POD} -- bao operator generate-root -init
-    # ... aportar los shares ...
-    kubectl -n ${NAMESPACE} exec -it ${ACTIVE_POD} -- bao operator generate-root -decode=... -otp=...
+    JWT=\$(kubectl -n ${NAMESPACE} create token ${OPERATOR_SA} --duration=1800s)
+    BAO_TOKEN=\$(kubectl -n ${NAMESPACE} exec -i ${ACTIVE_POD} -- sh -c \\
+      "BAO_TOKEN= bao write -field=token auth/kubernetes/login \\
+         role=${OPERATOR_SA} jwt='\$JWT'")
 
-Para revocarlo ahora:
+⚠️ NO cuentes con 'bao operator generate-root'. Desde OpenBao 2.6.0 ese comando
+   usa un endpoint AUTENTICADO: las 5 recovery keys NO alcanzan para acuñar un
+   root token — hace falta un token válido ADEMÁS de los shares. El rol
+   '${OPERATOR_SA}' de arriba es la única vía práctica de administración sin
+   root token. Detalle en k8s/docs/admin-access-recovery.md.
+
+Para revocar el root token ahora:
 
     kubectl -n ${NAMESPACE} exec -i ${ACTIVE_POD} -- \\
       env BAO_TOKEN="\$BAO_TOKEN" bao token revoke -self
