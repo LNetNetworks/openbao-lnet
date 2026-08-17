@@ -277,5 +277,8 @@ policies `sign-digest` requires), `redeploy-clean.md` (throwing the cluster away
 and rebuilding it with a **new seal key** — only while no keys are worth keeping),
 `admin-access-recovery.md` (**read this before revoking any token**: what
 `generate-root` no longer does since 2.6.0, the `openbao-operator` role, and how to
-get back in). `docs/storage.md` and
+get back in), `politicas-credenciales.md` (how authorization actually works:
+policies attach to *tokens* via auth roles, never to accounts — the exact commands,
+the four policies in production, and how to verify one does what it claims).
+`docs/storage.md` and
 `docs/dr-plan.md` hold the rationale behind those choices.
