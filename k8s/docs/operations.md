@@ -170,8 +170,10 @@ BAO_TOKEN=$BAO_TOKEN ./k8s/scripts/register-plugin.sh
 > Ese caso tiene su propia guía: [`plugin-update.md`](plugin-update.md). No es
 > solo el re-registro — hay una **ventana en la que `ethereum/*` falla** con
 > `checksums did not match` mientras los pods ya corren el binario nuevo y el
-> catálogo tiene el sha viejo, y con el root token revocado hace falta
-> `generate-root` con 3 recovery keys **antes** de empezar.
+> catálogo tiene el sha viejo, y con el root token revocado hace falta conseguir
+> un token administrativo **antes** de empezar — por el rol `openbao-operator`,
+> **no** por `generate-root`, que desde OpenBao 2.6.0 es un endpoint autenticado
+> ([`admin-access-recovery.md`](admin-access-recovery.md)).
 
 ### Subir el chart de Helm
 

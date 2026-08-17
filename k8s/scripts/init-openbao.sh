@@ -11,8 +11,10 @@
 # privadas anteriores quedan irrecuperables. Ver k8s/docs/unseal-keys.md.
 #
 # Como el seal es `gcpckms`, lo que imprime NO son unseal keys Shamir sino
-# RECOVERY KEYS: no desellan nada (de eso se encarga KMS), sirven para
-# `operator generate-root` y `operator rekey-recovery-key`.
+# RECOVERY KEYS: no desellan nada (de eso se encarga KMS). Son el quórum de
+# entrada de `sys/rotate/root/*` y `sys/rotate/recovery/*`, que desde OpenBao
+# 2.6.0 son endpoints AUTENTICADOS: los shares NO alcanzan solos para acuñar un
+# root token. Ver k8s/docs/admin-access-recovery.md.
 #
 # Uso:
 #   ./k8s/scripts/init-openbao.sh
@@ -60,7 +62,11 @@ fi
 INIT_STATUS="$(kexec bao status -format=json 2>/dev/null || true)"
 if echo "${INIT_STATUS}" | grep -q '"initialized": *true'; then
   red "El cluster YA está inicializado. No se hace nada."
-  echo "Si necesitás un root token nuevo, usá:  bao operator generate-root"
+  echo "Para un token administrativo NO uses generate-root (autenticado desde"
+  echo "2.6.0). Emitilo por el rol de auth de K8s 'openbao-operator':"
+  echo "  JWT=\$(kubectl -n ${NAMESPACE} create token openbao-operator --duration=1800s)"
+  echo "  bao write -field=token auth/kubernetes/login role=openbao-operator jwt=\$JWT"
+  echo "Detalle: k8s/docs/admin-access-recovery.md"
   exit 0
 fi
 
@@ -171,8 +177,10 @@ Siguientes pasos (k8s/docs/deployment.md):
   ./k8s/scripts/bootstrap-auth.sh      # audit, k8s auth, políticas, autopilot
   ./k8s/scripts/smoke-test.sh          # end-to-end
 
-Y al final: REVOCAR el root token (bootstrap-auth.sh lo ofrece).
-Para recuperarlo: bao operator generate-root, con ${RECOVERY_THRESHOLD} de las
-${RECOVERY_SHARES} recovery keys.
+Y al final: REVOCAR el root token (bootstrap-auth.sh lo ofrece, y antes prueba
+el camino de vuelta).
+Para administrar sin root token: el rol de auth de K8s 'openbao-operator'.
+Las ${RECOVERY_SHARES} recovery keys NO acuñan un root token por sí solas en
+OpenBao >=2.6.0 — ver k8s/docs/admin-access-recovery.md.
 ==============================================================================
 EOF

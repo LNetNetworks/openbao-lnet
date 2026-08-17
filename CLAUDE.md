@@ -192,9 +192,23 @@ is **the only file copied** into
   be removed from the main OpenBao distribution in the next minor release"*, in
   favour of a drop-in external plugin. **A bump to 2.7 breaks auto-unseal unless
   the seal is migrated first** — check this before any chart/appVersion upgrade.
+- **`generate-root` is authenticated since OpenBao 2.6.0** — it moved to
+  `sys/generate-root-token`, and the old unauthenticated `sys/generate-root` is
+  gone (405). **The 5 recovery keys cannot mint a root token on their own**: they
+  are the quorum *input* to operations that also require a valid token. Every
+  endpoint they used to serve (`sys/rotate/root/*`, `sys/rotate/recovery/*`,
+  `sys/rekey-recovery-key/*`) is now authenticated or removed. The way to an
+  administrative token is the **`openbao-operator` Kubernetes auth role** created
+  by `bootstrap-auth.sh` — whoever can `kubectl create token openbao-operator -n
+  openbao` is a vault operator, so cluster RBAC is now part of the custody story.
+  On 2026-08-17 revoking the root token without that role in place left the vault
+  with **no administrative access at all**. Full evidence and the way out:
+  [`k8s/docs/admin-access-recovery.md`](k8s/docs/admin-access-recovery.md).
+  **Never revoke the last administrative credential without first testing the way
+  back in, on that build** — `bootstrap-auth.sh` now does that test and aborts if
+  it fails.
 - The `root_token` stored in `openbao-prod-recovery` is **revoked**: after the
-  bootstrap the token is always revoked, so that field is dead material. Getting
-  an administrative token means `generate-root` with 3 of the 5 recovery keys.
+  bootstrap the token is always revoked, so that field is dead material.
 - The cluster is **zonal**: 3 replicas tolerate node loss, **not zone loss**.
   Zone loss ⇒ snapshot restore, RPO up to 6h.
 - CI builds the image automatically but **the tag bump is a manual job** —
@@ -202,9 +216,9 @@ is **the only file copied** into
 - Changing the plugin **binary** means re-registering its `sha256`. Between the
   rollout finishing and the re-register, every call to `ethereum/*` fails with
   `checksums did not match` **while the pods still report `1/1 Ready`** (readiness
-  probes `bao status`, not the engine). And with the root token revoked, you need
-  `generate-root` with 3 recovery keys *before* starting. See
-  [`k8s/docs/plugin-update.md`](k8s/docs/plugin-update.md).
+  probes `bao status`, not the engine). And with the root token revoked, get an
+  operator token *before* starting — via the `openbao-operator` K8s auth role, not
+  `generate-root`. See [`k8s/docs/plugin-update.md`](k8s/docs/plugin-update.md).
 
 ### Background docs (Spanish, the rationale)
 
@@ -248,5 +262,8 @@ scenarios), `kong-ingress.md` (the edge and its three gotchas), `operations.md`
 (runbook: failover, restore, upgrades, scaling), `plugin-update.md` (changing the
 plugin **binary** — the `sha256` window, the permissions it needs, and the
 policies `sign-digest` requires), `redeploy-clean.md` (throwing the cluster away
-and rebuilding it with a **new seal key** — only while no keys are worth keeping). `docs/storage.md` and
+and rebuilding it with a **new seal key** — only while no keys are worth keeping),
+`admin-access-recovery.md` (**read this before revoking any token**: what
+`generate-root` no longer does since 2.6.0, the `openbao-operator` role, and how to
+get back in). `docs/storage.md` and
 `docs/dr-plan.md` hold the rationale behind those choices.

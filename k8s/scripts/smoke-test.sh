@@ -12,10 +12,11 @@
 # El paso 2 provoca un failover REAL. Se puede saltar con SKIP_FAILOVER=1.
 #
 # BAO_TOKEN es OPCIONAL. Lo normal en este despliegue es NO tener uno: el root
-# token se revoca al terminar el bootstrap, y conseguir otro exige `generate-root`
-# con 3 de las 5 recovery keys. Sin token se corre todo lo que no necesita
-# credenciales (quórum, failover, edge) y los dos chequeos que sí las necesitan
-# se reportan como SALTADOS, no como fallos.
+# token se revoca al terminar el bootstrap, y conseguir otro es una operación
+# deliberada (rol de auth 'openbao-operator' — ver k8s/docs/admin-access-recovery.md).
+# Sin token se corre todo lo que no necesita credenciales (quórum, failover,
+# edge) y los dos chequeos que sí las necesitan se reportan como SALTADOS, no
+# como fallos.
 #
 # Uso:
 #   ./k8s/scripts/smoke-test.sh                      # sin token: salud del cluster
@@ -46,14 +47,19 @@ SKIPPED=0
 # de quórum cuando el cluster está perfecto.
 TOKEN_STATE=ausente
 
-generate_root_hint() {
+operator_token_hint() {
   cat <<EOF
-      Para obtener un token administrativo hacen falta 3 de las 5 recovery keys:
-          kubectl -n ${NAMESPACE} exec -it ${1:-openbao-0} -- bao operator generate-root -init
-          # aportar los 3 shares, y después:
-          kubectl -n ${NAMESPACE} exec -it ${1:-openbao-0} -- \\
-            bao operator generate-root -decode=<encoded> -otp=<otp>
+      Para un token administrativo, emitilo por el rol de auth de Kubernetes
+      'openbao-operator' (NO por generate-root: desde OpenBao 2.6.0 ese endpoint
+      es autenticado y las recovery keys no alcanzan solas):
+
+          JWT=\$(kubectl -n ${NAMESPACE} create token openbao-operator --duration=1800s)
+          export BAO_TOKEN=\$(curl -s \\
+            -d "{\\"role\\":\\"openbao-operator\\",\\"jwt\\":\\"\$JWT\\"}" \\
+            ${BAO_ADDR}/v1/auth/kubernetes/login | jq -r .auth.client_token)
+
       Revocalo al terminar:  bao token revoke -self
+      Detalle: k8s/docs/admin-access-recovery.md
 EOF
 }
 
@@ -85,7 +91,7 @@ else
   TOKEN_STATE=invalido
   warn "BAO_TOKEN definido pero NO válido (revocado o expirado) — los chequeos que"
   warn "necesitan credenciales se saltean; el resto corre igual"
-  generate_root_hint "${ACTIVE}"
+  operator_token_hint "${ACTIVE}"
 fi
 
 # --- Quórum: sin token, mirando cada réplica ----------------------------------
@@ -247,7 +253,7 @@ echo "[5/5] Firma end-to-end vía ${BAO_ADDR}"
 if [[ "${TOKEN_STATE}" != "ok" ]]; then
   skip "firma end-to-end — BAO_TOKEN ${TOKEN_STATE}; necesita un token administrativo"
   echo "      Lo demás ya se verificó: el cluster está sano y el edge responde."
-  generate_root_hint "${ACTIVE}"
+  operator_token_hint "${ACTIVE}"
   echo
   if [[ "${FAILURES}" -eq 0 ]]; then
     printf '\033[0;32mSmoke test OK\033[0m — %d fallos, %d saltados (sin token)\n' \

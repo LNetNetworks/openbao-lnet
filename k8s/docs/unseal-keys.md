@@ -158,31 +158,34 @@ kubectl -n openbao exec -i openbao-0 -- \
   env BAO_TOKEN=$BAO_TOKEN bao token revoke -self
 ```
 
-### Regenerarlo cuando haga falta
+### ⚠️ Las recovery keys NO regeneran el root token en este build
 
-Requiere 3 de las 5 recovery keys y una coordinación deliberada — que es
-exactamente el punto.
+Hasta OpenBao 2.5.x, `bao operator generate-root` era un endpoint **no
+autenticado** y 3 de las 5 recovery keys alcanzaban para acuñar un root token
+nuevo. **Desde 2.6.0 ya no**: el comando usa `sys/generate-root-token`, que
+**exige un token válido** además de los shares. Verificado contra el cluster
+(2.6.1): sin token devuelve `403 permission denied`, y el endpoint viejo
+`sys/generate-root/attempt` devuelve `405`.
+
+Las recovery keys siguen siendo **necesarias** —son el quórum de entrada de
+`sys/rotate/root/*` y `sys/rotate/recovery/*`— pero dejaron de ser
+**suficientes**. Guardarlas sigue importando; creer que alcanzan es lo peligroso.
+
+**El camino de vuelta real** es el rol de auth de Kubernetes `openbao-operator`,
+que crea `bootstrap-auth.sh`:
 
 ```bash
-POD=$(kubectl -n openbao get pods -l openbao-active=true -o jsonpath='{.items[0].metadata.name}')
-
-# 1. Iniciar. Devuelve un OTP y un nonce.
-kubectl -n openbao exec -it $POD -- bao operator generate-root -init
-#   Nonce: 1a2b3c...
-#   OTP:   XYZ...
-
-# 2. Cada custodio aporta su share (3 veces, con el mismo nonce)
-kubectl -n openbao exec -it $POD -- bao operator generate-root -nonce=<nonce>
-#   → pega el share cuando lo pida
-#   Tras el tercero devuelve: Encoded Token: <blob>
-
-# 3. Decodificar con el OTP
-kubectl -n openbao exec -it $POD -- \
-  bao operator generate-root -decode=<blob> -otp=<OTP>
-#   → el root token nuevo
+JWT=$(kubectl -n openbao create token openbao-operator --duration=1800s)
+export BAO_TOKEN=$(curl -s -d "{\"role\":\"openbao-operator\",\"jwt\":\"$JWT\"}" \
+  https://vault.l-net.io/v1/auth/kubernetes/login | jq -r .auth.client_token)
 ```
 
-Volver a revocarlo al terminar.
+Revocalo al terminar (`bao token revoke -self`).
+
+Esto mueve una parte de la custodia: además de las 5 recovery keys, **el acceso al
+`kubectl` del cluster pasó a ser material crítico**, porque es lo que emite ese
+token. Procedimiento completo, evidencia y qué hacer si ya te quedaste afuera:
+[`admin-access-recovery.md`](admin-access-recovery.md).
 
 ---
 

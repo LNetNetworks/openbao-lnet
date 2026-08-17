@@ -220,19 +220,20 @@ Si esto no pasa en local, no hay nada que desplegar.
 ### 3.1 Hace falta un token administrativo, y **no hay ninguno vivo**
 
 El paso 12 de [`deployment.md`](deployment.md) revoca el root token a propósito.
-`register-plugin.sh` necesita permisos sobre `sys/plugins/catalog/*`, así que
-antes de empezar hay que regenerar acceso con **3 de las 5 recovery keys**:
+`register-plugin.sh` necesita permisos sobre `sys/plugins/catalog/*`, que la
+política `openbao-operator` incluye. El token se emite por su rol de auth de
+Kubernetes:
 
 ```bash
-export POD=$(kubectl -n openbao get pods -l openbao-active=true -o jsonpath='{.items[0].metadata.name}')
-
-kubectl -n openbao exec -it $POD -- bao operator generate-root -init
-# ... aportar 3 shares ...
-kubectl -n openbao exec -it $POD -- bao operator generate-root -decode=<encoded> -otp=<otp>
-export BAO_TOKEN=<token generado>
+JWT=$(kubectl -n openbao create token openbao-operator --duration=1800s)
+export BAO_TOKEN=$(curl -s -d "{\"role\":\"openbao-operator\",\"jwt\":\"$JWT\"}" \
+  https://vault.l-net.io/v1/auth/kubernetes/login | jq -r .auth.client_token)
 ```
 
-Procedimiento completo y custodia de los shares:
+⚠️ **No sirve `bao operator generate-root` con las recovery keys.** Desde OpenBao
+2.6.0 ese endpoint es autenticado: los shares son necesarios pero no suficientes.
+Evidencia y alternativas en
+[`admin-access-recovery.md`](admin-access-recovery.md); custodia de los shares en
 [`unseal-keys.md`](unseal-keys.md).
 
 **Y revocarlo al terminar** (paso 7 de [§4](#4-despliegue-paso-a-paso)). Un root
@@ -659,5 +660,6 @@ Hoy ninguna de estas menciona `sign-digest`, a propósito (ver
 - [`../../plan-digest/README.md`](../../plan-digest/README.md) — por qué se forkea el plugin, el contrato del endpoint, y por qué Transit no sirve (no soporta secp256k1).
 - [`operations.md`](operations.md) — runbook general: failover, restore, upgrades, escalado.
 - [`deployment.md`](deployment.md) — el despliegue desde cero (y por qué no hay root token vivo).
-- [`unseal-keys.md`](unseal-keys.md) — `generate-root` con 3 de 5 recovery keys.
+- [`unseal-keys.md`](unseal-keys.md) — custodia de las recovery keys y qué dejaron de poder hacer.
+- [`admin-access-recovery.md`](admin-access-recovery.md) — cómo conseguir un token administrativo sin root token.
 - [`../../docs/throughput.md`](../../docs/throughput.md) — HA ≠ throughput. Aplica a `/sign`; `sign-digest` no emite transacciones, así que no toca el problema de nonces.

@@ -351,8 +351,8 @@ La diferencia es sustancial:
 | | Unseal keys (Shamir, el POC) | Recovery keys (KMS, producción) |
 |---|---|---|
 | Desellan el vault | Sí — hay que aportarlas en cada arranque | **No** — de eso se encarga Cloud KMS |
-| Para qué sirven | `bao operator unseal` | `bao operator generate-root`, `rekey-recovery-key` |
-| Si las perdés | El vault no vuelve a abrir | Perdés el acceso administrativo, pero el vault sigue operando |
+| Para qué sirven | `bao operator unseal` | quórum de entrada de `sys/rotate/root/*` y `sys/rotate/recovery/*` — **no** alcanzan solas para acuñar un root token en ≥2.6.0 |
+| Si las perdés | El vault no vuelve a abrir | El vault sigue operando; para administrarlo hace falta el rol `openbao-operator` (ver [`admin-access-recovery.md`](admin-access-recovery.md)) |
 | Si perdés la KMS key | — | **El vault no vuelve a abrir jamás** |
 
 El script guarda la salida en GCP Secret Manager (`openbao-prod-recovery`) antes
@@ -706,8 +706,17 @@ kubectl -n openbao exec -i $(kubectl -n openbao get pods \
 ```
 
 A partir de acá nadie tiene un token de administrador vivo. Cuando haga falta se
-regenera con 3 de las 5 recovery keys (`bao operator generate-root`).
-Procedimiento en [`unseal-keys.md`](unseal-keys.md).
+emite uno por el rol de auth de Kubernetes `openbao-operator`:
+
+```bash
+JWT=$(kubectl -n openbao create token openbao-operator --duration=1800s)
+export BAO_TOKEN=$(curl -s -d "{\"role\":\"openbao-operator\",\"jwt\":\"$JWT\"}" \
+  https://vault.l-net.io/v1/auth/kubernetes/login | jq -r .auth.client_token)
+```
+
+⚠️ **NO por `bao operator generate-root`**: desde OpenBao 2.6.0 ese endpoint es
+autenticado y las recovery keys no alcanzan solas. Detalle y evidencia en
+[`admin-access-recovery.md`](admin-access-recovery.md).
 
 ---
 
