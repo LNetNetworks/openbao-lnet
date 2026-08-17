@@ -132,16 +132,28 @@ Verified end-to-end against `https://vault.l-net.io` (`ecrecover` matches).
 
 What exists in production, and what does not:
 
-- **Dedicated account** `0x0617d688a3fe34f15d514357f54d5e1bc9cb7f8f` — for
-  `credentialHash` signing, **must never hold funds**.
+- **A dedicated account** for `credentialHash` signing, which **must never hold
+  funds**. Deliberately not written down here: addresses do not survive a
+  re-initialization, and a stale one in this file is worse than none. Read the
+  live one from the policy — `bao policy read ethsign-credentials` names the exact
+  address it is scoped to.
 - **Policy `ethsign-credentials`** — scoped to that one address, with cross-`deny`
   on `/sign`, `export/*`, account creation and listing. Verified against a real
   token in seven cases. ⚠️ It lives **only in the cluster**: no script recreates
   it, so a rebuild from the repo would not restore it.
-- **No K8s auth role yet** — a deliberate choice: no consumer is wired up, so the
-  endpoint is reachable only with an administrative token. Wiring a consumer means
-  adding a role bound to *its own* ServiceAccount, never `agroweb3/default`
-  (which every pod in that namespace shares).
+- **A K8s auth role for it.** Bind it to the consumer's *own* ServiceAccount,
+  never to `agroweb3/default` — every pod in that namespace shares that one.
+  Skipping this step is what left `sign-digest` unusable on 2026-08-17: the policy
+  existed, the role did not, and by the time anyone tried to create it there was no
+  administrative token left to do it with.
+
+⚠️ **Private keys do not survive a re-initialization, and cannot be exported**
+(`ethereum/export/*` is denied in every policy). Anything that hardcodes an
+address — a client `.env`, a DID, an allowlist, a contract whose `owner` is the
+deployer EOA — breaks. When auditing for such references, note that `grep` on this
+machine is **ugrep**, which honours `.gitignore` in recursive mode: `.env` files
+are invisible unless you pass `--no-ignore-files`. A recursive grep that finds
+nothing is not evidence.
 
 Where things live — [`plugin/`](plugin/guide-implementation-sign-digest.md) (how it
 was built and the three problems hit locally),
