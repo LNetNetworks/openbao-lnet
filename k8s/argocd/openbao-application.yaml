@@ -69,7 +69,9 @@ spec:
             registry: us-central1-docker.pkg.dev
             repository: l-net-469615/l-net-docker-repo/openbao-ethsign
             # ↓↓↓ ESTE es el campo que bumpea el job manual del pipeline ↓↓↓
-            tag: "3fd9333"
+            # 4ebe987 es la primera imagen con el endpoint sign-digest
+            # (plugin compilado del fork LNetNetworks @ 236094bd).
+            tag: "4ebe987"
             pullPolicy: IfNotPresent
 
           logLevel: info
@@ -263,11 +265,15 @@ spec:
                 # `bao operator init` con este seal devuelve RECOVERY KEYS
                 # (no unseal keys Shamir) — ver k8s/docs/unseal-keys.md.
                 # Credenciales por Workload Identity (ADC), sin archivo JSON.
+                # crypto_key: la `-v2` es el linaje nuevo, creado en el
+                # redespliegue limpio del 2026-08-17. La `openbao-unseal-key`
+                # original protege la root key de un vault que ya no existe y se
+                # deshabilita al cerrar el redespliegue. NO volver a apuntar acá.
                 seal "gcpckms" {
                   project    = "l-net-469615"
                   region     = "global"
                   key_ring   = "openbao-unseal"
-                  crypto_key = "openbao-unseal-key"
+                  crypto_key = "openbao-unseal-key-v2"
                 }
 
                 # AUDIT DEVICE — declarativo, NO por API.

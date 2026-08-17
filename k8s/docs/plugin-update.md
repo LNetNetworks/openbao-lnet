@@ -556,9 +556,9 @@ vault el que construye la tx.
    path "ethereum/accounts/+/sign-digest" { capabilities = ["deny"] }
    ```
 
-   Eso va en el heredoc de la política `ethsign-signer` de
-   `k8s/scripts/bootstrap-auth.sh`, y se aplica re-corriendo el script
-   (idempotente). Dejarlo en el script y no solo en el cluster es lo que evita
+   **Ya está en el heredoc** de la política `ethsign-signer` de
+   `k8s/scripts/bootstrap-auth.sh`: se aplica solo con correr el script
+   (idempotente). Que viva en el script y no solo en el cluster es lo que evita
    que el próximo bootstrap lo revierta.
 
 5. **Auditoría.** El audit device declarativo ya registra cada llamada. Vale la

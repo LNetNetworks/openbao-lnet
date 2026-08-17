@@ -87,7 +87,7 @@ kexec bao operator raft autopilot state || true
 # ---------------------------------------------------------------------------
 # 3. Políticas
 # ---------------------------------------------------------------------------
-echo "==> Política 'ethsign-signer' (crear cuentas y firmar; NO exportar)"
+echo "==> Política 'ethsign-signer' (crear cuentas y firmar txs; NO exportar ni firmar digests)"
 kexec_stdin bao policy write ethsign-signer - <<EOF
 # Crear cuentas nuevas y listarlas
 path "${MOUNT_PATH}/accounts" {
@@ -102,6 +102,14 @@ path "${MOUNT_PATH}/accounts/*" {
 # Firmar
 path "${MOUNT_PATH}/accounts/+/sign" {
   capabilities = ["create", "update"]
+}
+
+# FIRMAR DIGESTS CRUDOS ESTÁ EXPLÍCITAMENTE DENEGADO.
+# El hash de una tx es keccak256(RLP(tx)), calculable off-chain: quien pueda
+# firmar un digest arbitrario puede armar cualquier transacción. Va en su propia
+# política (ethsign-credentials, ver k8s/docs/plugin-update.md §6), no acá.
+path "${MOUNT_PATH}/accounts/+/sign-digest" {
+  capabilities = ["deny"]
 }
 
 # EXPORTAR LA LLAVE PRIVADA ESTÁ EXPLÍCITAMENTE DENEGADO.
