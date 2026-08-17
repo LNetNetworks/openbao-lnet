@@ -182,10 +182,11 @@ git add gitops-apps/argocd-applications/openbao.yaml \
 git commit -m "feat(openbao): despliegue de OpenBao HA en GKE" && git push
 ```
 
-> ⚠️ **Estaquear por fichero, nunca `git add -A`.** El paso 5 deja
-> `seal.json` con las recovery keys y el root token **en claro** en el repo del
-> POC. Ya está en `.gitignore`, pero el hábito de `-A` es el que un día lo
-> sube. Ver el aviso del paso 5.
+> ⚠️ **Estaquear por fichero, nunca `git add -A`.** El repo del POC acumula
+> archivos que no van a `cloud-infra` (y `cloud-infra` tiene lo suyo). El paso 5
+> no deja material sensible en el working tree —lo manda a Secret Manager por
+> stdin—, pero el hábito de `-A` es el que un día sube algo que sí. Ver el aviso
+> del paso 5.
 
 ### Cómo llega el cambio al cluster (importa para diagnosticar)
 
@@ -370,25 +371,27 @@ El JSON contiene 5 recovery keys y el `root_token`. Ver
   Docker Compose lo autocarga y revienta con las líneas que llevan espacios
   (gotcha documentado en `CLAUDE.md`).
 
-> ⚠️ **`seal.json` queda en el working tree.** El script deja la salida del init
-> en `seal.json` (y en `k8s/secrets-seal/seal.json`): **5 recovery keys y el
-> root token en texto plano**. Ambas rutas están en `.gitignore`, pero un
-> `git add -A` distraído las subiría igual — por eso el paso 3 insiste en
-> estaquear por fichero.
+> ✅ **El material no toca el disco local.** El script manda la salida del init a
+> Secret Manager por stdin (`--data-file=-`) y no escribe ningún archivo: no hay
+> `seal.json` que borrar. `.gitignore` cubre `seal.json`, `seal*.json` y
+> `k8s/secrets-seal/` como red de seguridad por si alguien redirige la salida a
+> mano — no porque el script los genere.
 >
-> En cuanto verifiques que Secret Manager tiene el material, **borralas**:
+> Dónde **sí** queda expuesto el material: en el **scrollback de la terminal**,
+> porque el script lo imprime al final para que puedas repartir las shares. Cerrá
+> esa ventana cuando termines, y no lo pegues en un chat ni en un ticket.
+>
+> Verificá la copia de Secret Manager antes de perder el scrollback:
 >
 > ```bash
 > gcloud secrets versions access latest \
 >   --secret=openbao-prod-recovery --project=l-net-469615 | head -c 80
 > # `latest`, NO `1`: si el cluster se redesplegó alguna vez, la versión 1 es el
 > # material del linaje viejo — ver redeploy-clean.md.
->
-> rm -f seal.json k8s/secrets-seal/seal.json
 > ```
 >
-> No las borres antes de comprobarlo: si la copia de Secret Manager estuviera
-> incompleta, serían el único ejemplar de un material irrecuperable.
+> Si esa copia estuviera incompleta, el scrollback sería el único ejemplar de un
+> material irrecuperable.
 
 ---
 
@@ -752,7 +755,8 @@ Usar siempre `openbao-active` (apunta al líder), no `openbao`.
 - [ ] Una IP fuera del allowlist recibe 403
 - [ ] Firma end-to-end OK
 - [ ] Recovery keys repartidas entre 5 custodios + copia en Secret Manager
-- [ ] **`seal.json` y `k8s/secrets-seal/` borrados** del working tree
+- [ ] Copia en Secret Manager verificada (`versions access latest`) y scrollback
+      de la terminal cerrado — el init no deja archivos, solo salida en pantalla
 - [ ] Root token revocado
 - [ ] Snapshot de prueba visible en GCS
 - [ ] Target `openbao` UP en Prometheus

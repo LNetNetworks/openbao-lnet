@@ -168,20 +168,31 @@ git add gitops-apps/argocd-applications/kustomization.yaml
 git commit -m "chore(openbao): baja temporal para redespliegue limpio" && git push
 ```
 
-`apps-root` prunea la Application y su finalizer
+⚠️ **Sacarla de git no la borra sola.** `apps-root` está declarado con
+`prune: false` (`gitops-apps/argocd-applications/root-apps.yaml`), así que quitar
+la línea del `kustomization.yaml` deja a `apps-root` `OutOfSync` con un recurso
+"de más" y la Application `openbao` **sigue viva**. El commit es igual
+imprescindible: es lo que le quita el estado deseado, para que `selfHeal` no la
+recree cuando la borres.
+
+Con el commit ya pusheado, borrala a mano — el finalizer
 (`resources-finalizer.argocd.argoproj.io`) borra en cascada StatefulSet,
-Services, Ingress, ServiceMonitor y KongPlugin.
+Services, Ingress, ServiceMonitor, KongPlugin, PDB y RBAC:
 
 ```bash
-kubectl -n argocd get application apps-root \
-  -o jsonpath='{.status.sync.status} {.status.sync.revision}{"\n"}'
-kubectl -n argocd get application openbao       # → NotFound
-kubectl -n openbao get sts,svc,ingress          # → vacío
+kubectl -n argocd delete application openbao     # bloquea hasta que el finalizer termina
+kubectl -n argocd get application openbao        # → NotFound
+kubectl -n openbao get sts,svc,ingress           # → vacío
 ```
 
-Si tarda, sincronizar `apps-root` a mano desde https://ops-console.l-net.io
-—mirando antes qué otras Applications arrastra, porque sincroniza todo el
-directorio.
+**No sincronices `apps-root` a mano** para forzar esto: sincroniza *todo* el
+directorio y arrastra cualquier otra Application que esté `OutOfSync` en ese
+momento (al 2026-08-17 eran `db-backups`, `dev-keycloak` y `edge-system`). Con
+`prune: false` tampoco serviría de nada.
+
+> Si algún día `root-apps.yaml` pasa a `prune: true`, el `kubectl delete` deja de
+> ser necesario: el push solo alcanza. Verificalo antes de asumirlo:
+> `kubectl -n argocd get application apps-root -o jsonpath='{.spec.syncPolicy.automated}'`
 
 ### Paso 2 — Borrar el estado (los PVCs **no** se van solos)
 
@@ -295,9 +306,10 @@ git add gitops-apps/argocd-applications/openbao.yaml \
 git commit -m "feat(openbao): redespliegue limpio con sign-digest y key de sellado nueva" && git push
 ```
 
-> ⚠️ Estaquear **por fichero**, nunca `git add -A`: el paso siguiente vuelve a
-> dejar `seal.json` con recovery keys y root token en claro en el working tree
-> del POC.
+> ⚠️ Estaquear **por fichero**, nunca `git add -A`. El paso siguiente no escribe
+> material sensible en el working tree (`init-openbao.sh` manda el init a Secret
+> Manager por stdin), pero el hábito de `-A` en dos repos a la vez es el que
+> termina subiendo algo que no va.
 
 Y mirar `apps-root`, no `openbao` (su `revision: 0.28.6` es la versión del chart,
 no un commit):
@@ -392,7 +404,8 @@ gcloud kms keys versions disable 1 --key=openbao-unseal-key \
 | Pods `Running` pero sellados, errores de descifrado en los logs | PVCs viejos + key de sellado nueva | Paso 2 |
 | Todo levanta perfecto y aparecen las cuentas viejas | PVCs viejos + key vieja: es el vault anterior | Paso 2, y revisar que el Application apunte a `openbao-unseal-key-v2` |
 | `CrashLoopBackOff` con `error checking key existence: PermissionDenied` | A la key nueva le falta `roles/cloudkms.viewer` | Re-correr `KMS_KEY=… setup-gcp.sh` |
-| La Application vuelve a aparecer después de borrarla | `apps-root` con selfHeal la recrea | Paso 1: sacarla de git, no del cluster |
+| La Application vuelve a aparecer después de borrarla | `apps-root` con selfHeal la recrea | Paso 1: sacarla de git **primero**, después `kubectl delete` |
+| Se pusheó la baja pero la Application sigue ahí | `apps-root` tiene `prune: false` | Paso 1: `kubectl -n argocd delete application openbao` |
 | Un solo pod y `0/1 Ready` | Normal antes del init (`OrderedReady`) | Paso 7: correr `init-openbao.sh` |
 | PV en `Released` colgado | El PVC se borró pero el PV no reclamó | `kubectl delete pv <nombre>` |
 | `unsupported path` en `sign-digest` | La imagen no trae el endpoint | §3: verificar el `grep` en el binario |
@@ -412,7 +425,7 @@ gcloud kms keys versions disable 1 --key=openbao-unseal-key \
 **Destrucción**
 
 - [ ] `openbao.yaml` fuera de `kustomization.yaml` en cloud-infra y pusheado
-- [ ] `apps-root` sincronizado; `Application/openbao` → NotFound
+- [ ] `Application/openbao` borrada a mano (`apps-root` no prunea) → NotFound
 - [ ] Namespace `openbao` (o los 6 PVCs) borrado — `get pvc` vacío
 - [ ] Sin PVs colgados en `Released`
 
@@ -423,7 +436,8 @@ gcloud kms keys versions disable 1 --key=openbao-unseal-key \
 - [ ] `openbao.yaml` de vuelta en `kustomization.yaml` y pusheado
 - [ ] `init-openbao.sh` corrido **una sola vez**; material en Secret Manager (`latest`)
 - [ ] Recovery keys nuevas repartidas entre 5 custodios; las viejas retiradas
-- [ ] `seal.json` y `k8s/secrets-seal/` borrados del working tree
+- [ ] Material del init verificado en Secret Manager con `versions access latest`
+      (el script no deja archivos; la exposición es el scrollback de la terminal)
 - [ ] `register-plugin.sh` + `bootstrap-auth.sh` + CronJob re-aplicado
 - [ ] `smoke-test.sh` en verde (incluido el failover)
 - [ ] `verify-sign-digest.sh` en verde contra `https://vault.l-net.io`
