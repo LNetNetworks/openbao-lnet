@@ -194,6 +194,79 @@ momento (al 2026-08-17 eran `db-backups`, `dev-keycloak` y `edge-system`). Con
 > ser necesario: el push solo alcanza. Verificalo antes de asumirlo:
 > `kubectl -n argocd get application apps-root -o jsonpath='{.spec.syncPolicy.automated}'`
 
+### ⚠️ La trampa del `kubectl delete namespace openbao`
+
+Esto no es específico del redespliegue: aplica a **cualquier** borrado del
+namespace, incluido el de un re-init. Vale leerlo antes.
+
+**Si ArgoCD tiene una sync en curso cuando borrás el namespace, el despliegue
+queda muerto y no se recupera solo.** Pasó el 2026-08-17: una sync de `selfHeal`
+—disparada por drift en `RoleBinding/openbao-discovery-rolebinding`— estaba
+corriendo, alcanzó a re-aplicar el Namespace mientras estaba en `Terminating`
+(`"Detected changes to resource openbao which is currently being deleted"`), y la
+operación quedó colgada esperando para siempre a un namespace que ya no existía:
+
+```
+opPhase   = Running
+opMessage = waiting for healthy state of /Namespace/openbao
+```
+
+Y lo que lo vuelve irrecuperable es esto, en los logs del
+`argocd-application-controller`:
+
+```
+Skipping auto-sync: failed previous sync attempt to [0.28.6]
+and will not retry for [0.28.6]
+```
+
+**ArgoCD no reintenta el auto-sync para la misma revisión.** Esta Application no
+apunta a un commit de git sino a `targetRevision: 0.28.6` —la versión del chart de
+Helm—, así que **la revisión nunca cambia** y el auto-sync queda bloqueado
+indefinidamente. Esperar no sirve de nada.
+
+**Síntoma:** `kubectl -n openbao get pods -w` no muestra nada y no da error
+(porque el namespace no existe), `Application/openbao` en `OutOfSync` /
+`health: Missing`, y `reconciledAt` avanzando sin que pase nada.
+
+**Diagnóstico:**
+
+```bash
+kubectl -n argocd get application openbao \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.message}{"\n"}'
+kubectl -n argocd logs argocd-application-controller-0 --since=6m | grep -i openbao
+```
+
+**Destrabe** (no hay `argocd` CLI en el entorno, así que va por `kubectl`):
+
+```bash
+# 1. Cancelar la operación colgada
+kubectl -n argocd patch application openbao --type=json \
+  -p '[{"op":"remove","path":"/operation"}]'
+kubectl -n argocd patch application openbao --type merge \
+  -p '{"status":{"operationState":{"phase":"Terminating"}}}'
+
+# 2. Esperar a que quede en Failed ("Operation terminated"), y disparar una sync
+#    MANUAL — es lo que resetea la guarda del "will not retry"
+kubectl -n argocd patch application openbao --type merge -p '{
+  "operation": {"initiatedBy": {"username": "manual-unblock"},
+    "sync": {"revision": "0.28.6", "prune": true,
+             "syncOptions": ["CreateNamespace=true", "ServerSideApply=true"]}}}'
+```
+
+El paso 2 hay que hacerlo **después** de que la operación vieja quede en `Failed`:
+si se dispara mientras todavía está terminando, el controller procesa la
+terminación y descarta la sync nueva. Se nota porque el `phase` sigue mostrando
+`Operation terminated` y el namespace no aparece — se vuelve a aplicar el patch y
+listo.
+
+**Para evitarlo:** antes de borrar el namespace, comprobá que no haya una
+operación en vuelo:
+
+```bash
+kubectl -n argocd get application openbao \
+  -o jsonpath='{.status.operationState.phase}{"\n"}'   # debe decir Succeeded
+```
+
 ### Paso 2 — Borrar el estado (los PVCs **no** se van solos)
 
 Este es **el paso que no se puede saltear**, y el que produce el fallo más
@@ -407,6 +480,8 @@ gcloud kms keys versions disable 1 --key=openbao-unseal-key \
 | La Application vuelve a aparecer después de borrarla | `apps-root` con selfHeal la recrea | Paso 1: sacarla de git **primero**, después `kubectl delete` |
 | Se pusheó la baja pero la Application sigue ahí | `apps-root` tiene `prune: false` | Paso 1: `kubectl -n argocd delete application openbao` |
 | Un solo pod y `0/1 Ready` | Normal antes del init (`OrderedReady`) | Paso 7: correr `init-openbao.sh` |
+| `get pods -w` no muestra nada y el namespace no vuelve | Sync de ArgoCD colgada + `will not retry for [0.28.6]` | [La trampa del `kubectl delete namespace`](#-la-trampa-del-kubectl-delete-namespace-openbao) |
+| `* internal error` en `ethereum/*` por `kubectl exec` | Ejecutaste contra un **standby**; el plugin solo responde en el líder | `exec` contra el pod con `openbao-active=true` |
 | PV en `Released` colgado | El PVC se borró pero el PV no reclamó | `kubectl delete pv <nombre>` |
 | `unsupported path` en `sign-digest` | La imagen no trae el endpoint | §3: verificar el `grep` en el binario |
 | `403` en `sign-digest` | Falta la política/rol de digests | `plugin-update.md` §6 |
@@ -421,6 +496,7 @@ gcloud kms keys versions disable 1 --key=openbao-unseal-key \
 - [ ] Fork del plugin con `sign-digest`, variante decidida, `go test ./...` en verde
 - [ ] Imagen construida `--platform linux/amd64` y verificada (`grep sign-digest`)
 - [ ] CronJob de snapshots suspendido
+- [ ] **Ninguna sync de ArgoCD en vuelo** (`operationState.phase` = `Succeeded`) antes de borrar el namespace
 
 **Destrucción**
 

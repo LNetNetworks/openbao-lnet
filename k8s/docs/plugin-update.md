@@ -511,6 +511,49 @@ vault el que construye la tx.
 
 1. **Cuenta dedicada** para los `credentialHash`, **sin saldo**, distinta de las
    que firman transacciones on-chain.
+
+   > ⚠️ **Las cuentas no tienen "tipo".** El plugin no distingue una cuenta de
+   > `/sign` de una de `sign-digest`: las dos se crean con el mismo comando y son
+   > llaves secp256k1 idénticas. **Lo que las separa es la política, no la
+   > cuenta.** Con un token administrativo, cualquier cuenta puede hacer las dos
+   > cosas. La separación existe porque `ethsign-signer` deniega `sign-digest` y
+   > `ethsign-credentials` deniega `/sign` y está acotada a **una** address.
+   > Corolario: si mañana alguien escribe una política más laxa, la cuenta
+   > "dedicada" deja de estar dedicada. El control es la política.
+
+   Crear ambas cuentas es el mismo comando. Por CLI, contra el **nodo activo**
+   (`bao write -f` = POST con cuerpo vacío → el plugin genera la llave adentro):
+
+   ```bash
+   export POD=$(kubectl -n openbao get pods -l openbao-active=true \
+     -o jsonpath='{.items[0].metadata.name}')
+
+   # Cuenta para firmar transacciones (la que va en el .env del cliente)
+   kubectl -n openbao exec -i $POD -- env BAO_TOKEN="$BAO_TOKEN" \
+     bao write -f -format=json ethereum/accounts | jq -r .data.address
+
+   # Cuenta dedicada para credentialHash (sin saldo, nunca fondearla)
+   kubectl -n openbao exec -i $POD -- env BAO_TOKEN="$BAO_TOKEN" \
+     bao write -f -format=json ethereum/accounts | jq -r .data.address
+   ```
+
+   O por HTTP, equivalente:
+
+   ```bash
+   curl -s -H "X-Vault-Token: $BAO_TOKEN" -H "Content-Type: application/json" \
+     -d '{}' https://vault.l-net.io/v1/ethereum/accounts | jq -r .data.address
+   ```
+
+   La llave privada **nunca sale del vault**: la respuesta trae solo `address`.
+   Y **no se puede exportar** (`ethereum/export/*` está denegado en todas las
+   políticas), así que estas addresses **no sobreviven a una re-inicialización** —
+   ver el aviso de
+   [`admin-access-recovery.md` §4](admin-access-recovery.md#opción-a--re-inicializar-recomendada-mientras-no-haya-nada-valioso).
+
+   ⚠️ **El `exec` tiene que ir al nodo activo.** El plugin solo responde en el
+   líder de Raft: contra un standby, `ethereum/*` falla con un
+   `* internal error` sin más contexto (no un 307, no un redirect). Por HTTP no
+   pasa, porque el Ingress apunta al Service `openbao-active`.
 2. **Políticas separadas con `deny` cruzado** (`deny` siempre gana en OpenBao).
    La plantilla está en
    [`../../plan-digest/policies/ethsign-digest.hcl`](../../plan-digest/policies/ethsign-digest.hcl)
