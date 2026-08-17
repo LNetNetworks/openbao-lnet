@@ -86,7 +86,7 @@ Sign payload fields: `to` (omit to deploy a contract), `data` (hex `0x…`),
 `value`, `nonce` (hex string, e.g. `"0x0"`), `gas`, `gasPrice`, `chainId`
 (EIP-155 — e.g. LACChain networks). Auth header on every call: `X-Vault-Token: $BAO_TOKEN`.
 
-### ★ `sign-digest` — not upstream, not in production yet
+### ★ `sign-digest` — not upstream, live in production since 2026-08-17
 
 Signs a **32-byte digest as-is**: no transaction wrapping, no EIP-191 prefix, no
 re-hashing. Returns a recoverable, canonical low-s (EIP-2) signature —
@@ -117,17 +117,38 @@ Four things to know before touching it:
   to sign any transaction. Mitigation is not optional: dedicated account with no
   balance, separate policies with cross-`deny`
   ([`plan-digest/policies/ethsign-digest.hcl`](plan-digest/policies/ethsign-digest.hcl)).
-- **The `ethsign-signer` policy does not cover it.** `path "…/accounts/+/sign"`
-  has no trailing `*`, so `sign-digest` is denied by default — correct, and it
-  should stay that way. Consumers need their own policy + K8s auth role.
+- **The `ethsign-signer` policy denies it explicitly.** `path "…/accounts/+/sign"`
+  has no trailing `*`, so `sign-digest` was already denied implicitly; since
+  2026-08-17 `bootstrap-auth.sh` also writes an explicit
+  `path "…/accounts/+/sign-digest" { capabilities = ["deny"] }` so the protection
+  no longer rests on how path matching is read. Consumers need their own policy +
+  K8s auth role.
 
-Status: fork created and its Go test suite green; it is the **default** of the
-local build. **Production still runs the upstream binary** (image tag `3fd9333`)
-— rolling it out is pending. Where things live —
-[`plugin/`](plugin/guide-implementation-sign-digest.md) (how it was built and the
-three problems hit locally), [`plan-digest/`](plan-digest/README.md) (fork
-package: source, Go test, `scripts/verify-sign-digest.sh`, policies),
-[`k8s/docs/plugin-update.md`](k8s/docs/plugin-update.md) (deploying it to GKE).
+Status: **in production** since 2026-08-17, image tag `4ebe987`, deployed via a
+clean redeploy ([`k8s/docs/redeploy-clean.md`](k8s/docs/redeploy-clean.md)) rather
+than an in-place plugin update — the old cluster held only test accounts, so
+throwing it away avoided both the `sha256` window and the `generate-root`.
+Verified end-to-end against `https://vault.l-net.io` (`ecrecover` matches).
+
+What exists in production, and what does not:
+
+- **Dedicated account** `0x0617d688a3fe34f15d514357f54d5e1bc9cb7f8f` — for
+  `credentialHash` signing, **must never hold funds**.
+- **Policy `ethsign-credentials`** — scoped to that one address, with cross-`deny`
+  on `/sign`, `export/*`, account creation and listing. Verified against a real
+  token in seven cases. ⚠️ It lives **only in the cluster**: no script recreates
+  it, so a rebuild from the repo would not restore it.
+- **No K8s auth role yet** — a deliberate choice: no consumer is wired up, so the
+  endpoint is reachable only with an administrative token. Wiring a consumer means
+  adding a role bound to *its own* ServiceAccount, never `agroweb3/default`
+  (which every pod in that namespace shares).
+
+Where things live — [`plugin/`](plugin/guide-implementation-sign-digest.md) (how it
+was built and the three problems hit locally),
+[`plan-digest/`](plan-digest/README.md) (fork package: source, Go test,
+`scripts/verify-sign-digest.sh`, policies),
+[`k8s/docs/plugin-update.md`](k8s/docs/plugin-update.md) (changing the binary from
+here on — a live cluster means the `sha256` window is back).
 
 ## Production on Kubernetes — `k8s/` (implemented)
 
@@ -164,6 +185,16 @@ is **the only file copied** into
 - With KMS auto-unseal, `operator init` yields **recovery keys**, not Shamir
   unseal keys. They don't unseal; they regenerate the root token.
   **Destroying the KMS key closes the vault permanently** — recovery keys don't help.
+  The live seal key is **`openbao-unseal-key-v2`** (the original
+  `openbao-unseal-key` is `DISABLED` — it protects a vault that no longer exists;
+  GCP does not allow deleting keys or key rings, only disabling them).
+- **The builtin `gcpckms` seal is deprecated.** OpenBao 2.6.1 logs that it *"will
+  be removed from the main OpenBao distribution in the next minor release"*, in
+  favour of a drop-in external plugin. **A bump to 2.7 breaks auto-unseal unless
+  the seal is migrated first** — check this before any chart/appVersion upgrade.
+- The `root_token` stored in `openbao-prod-recovery` is **revoked**: after the
+  bootstrap the token is always revoked, so that field is dead material. Getting
+  an administrative token means `generate-root` with 3 of the 5 recovery keys.
 - The cluster is **zonal**: 3 replicas tolerate node loss, **not zone loss**.
   Zone loss ⇒ snapshot restore, RPO up to 6h.
 - CI builds the image automatically but **the tag bump is a manual job** —
